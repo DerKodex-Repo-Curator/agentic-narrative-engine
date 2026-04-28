@@ -55,6 +55,7 @@ class Config:
     MAX_STEPS_LIMIT = _safe_int.__func__(os.getenv("MAX_STEPS_LIMIT"), 50)
     DEFAULT_DELAY = _safe_int.__func__(os.getenv("DEFAULT_DELAY"), 3)
     MAX_DELAY = _safe_int.__func__(os.getenv("MAX_DELAY"), 10)
+    AUTOPLAY_REPEAT = _safe_int.__func__(os.getenv("AUTOPLAY_REPEAT"), 1)
 
     # Request Configuration
     REQUEST_TIMEOUT = _safe_int.__func__(os.getenv("REQUEST_TIMEOUT"), 30)
@@ -63,6 +64,9 @@ class Config:
     PROMPTS_DIR = os.getenv("PROMPTS_DIR", ".")
     GM_PROMPT_FILE = os.getenv("GM_PROMPT_FILE", "gm_prompt.txt")
     PLAYER_PROMPT_FILE = os.getenv("PLAYER_PROMPT_FILE", "rp_prompt.txt")
+
+    # Ollama: comma-separated model override (leave empty to auto-detect from Ollama API)
+    OLLAMA_MODELS = os.getenv("OLLAMA_MODELS", "")
 
     # Game context flag
     IS_GAME_CONTEXT = _safe_bool.__func__(os.getenv("IS_GAME_CONTEXT", "true"), True)

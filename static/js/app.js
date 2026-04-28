@@ -18,6 +18,8 @@ const stepsSlider = document.getElementById('stepsSlider');
 const stepsValue = document.getElementById('stepsValue');
 const delaySlider = document.getElementById('delaySlider');
 const delayValue = document.getElementById('delayValue');
+const repeatInput = document.getElementById('repeatInput');
+const repeatValue = document.getElementById('repeatValue');
 const chatbox = document.getElementById('chatbox');
 const statusBar = document.getElementById('statusBar');
 const modelBadge = document.getElementById('modelBadge');
@@ -55,6 +57,7 @@ function setupEventListeners() {
     // Slider updates
     stepsSlider.addEventListener('input', updateSliderLabels);
     delaySlider.addEventListener('input', updateSliderLabels);
+    repeatInput.addEventListener('input', updateSliderLabels);
 
     // Buttons
     startBtn.addEventListener('click', startGame);
@@ -93,6 +96,7 @@ function setupEventListeners() {
 function updateSliderLabels() {
     stepsValue.textContent = stepsSlider.value;
     delayValue.textContent = delaySlider.value;
+    repeatValue.textContent = repeatInput.value;
 }
 
 async function loadProviderModels(provider) {
@@ -100,12 +104,32 @@ async function loadProviderModels(provider) {
         const response = await fetch(`/api/provider/${encodeURIComponent(provider)}`);
         const config = await response.json();
 
+        let models = config.models;
+        let defaultModel = config.default_model;
+
+        if (provider === 'Ollama (Local)') {
+            try {
+                const ollamaResp = await fetch('/api/ollama/models');
+                const ollamaData = await ollamaResp.json();
+                if (ollamaData.models && ollamaData.models.length > 0) {
+                    models = ollamaData.models;
+                    defaultModel = ollamaData.default_model;
+                } else {
+                    models = ['(no models found — is Ollama running?)'];
+                    defaultModel = models[0];
+                }
+            } catch (e) {
+                models = ['(could not reach Ollama)'];
+                defaultModel = models[0];
+            }
+        }
+
         modelSelect.innerHTML = '';
-        config.models.forEach(model => {
+        models.forEach(model => {
             const option = document.createElement('option');
             option.value = model;
             option.textContent = model;
-            if (model === config.default_model) {
+            if (model === defaultModel) {
                 option.selected = true;
             }
             modelSelect.appendChild(option);
@@ -115,7 +139,7 @@ async function loadProviderModels(provider) {
         apiKeyInput.style.display = config.requires_key ? 'block' : 'none';
 
         // Update model badge
-        modelBadge.textContent = `${provider} - ${config.default_model}`;
+        modelBadge.textContent = `${provider} - ${defaultModel || models[0] || ''}`;
     } catch (error) {
         console.error('Error loading provider config:', error);
     }
@@ -334,8 +358,73 @@ async function nextStep() {
     setProcessing(false);
 }
 
+async function runSingleAutoplay(runIndex, totalRuns) {
+    let currentContent = '';
+    let currentStep = 0;
+
+    const response = await fetch('/api/autoplay', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(getRequestData()),
+        signal: abortController.signal
+    });
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let lastMessageType = null;
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const text = decoder.decode(value);
+        const lines = text.split('\n');
+
+        for (const line of lines) {
+            if (line.startsWith('data: ')) {
+                try {
+                    const data = JSON.parse(line.slice(6));
+
+                    const runLabel = totalRuns > 1 ? ` (run ${runIndex}/${totalRuns})` : '';
+                    if (data.type === 'status') {
+                        setStatus(`<strong>Status:</strong> ${data.message}${runLabel}`);
+                    } else if (data.type === 'chunk') {
+                        if (data.choice && lastMessageType !== 'user') {
+                            addMessage('user', data.choice.toString());
+                            addMessage('bot', '');
+                            currentContent = '';
+                            lastMessageType = 'user';
+                        } else if (!lastMessageType || lastMessageType === 'step_done') {
+                            addMessage('bot', '');
+                            currentContent = '';
+                            lastMessageType = 'bot';
+                        }
+                        currentContent += data.content;
+                        updateLastBotMessage(currentContent);
+                    } else if (data.type === 'step_done') {
+                        currentStep = data.step;
+                        setStatus(`<strong>Status:</strong> Auto-play Step ${currentStep}/${stepsSlider.value}${runLabel}`);
+                        lastMessageType = 'step_done';
+                        currentContent = '';
+                        gameStarted = true;
+                    } else if (data.type === 'complete') {
+                        setStatus(`<strong>Status:</strong> Run ${runIndex}/${totalRuns} complete (${data.step} steps)`);
+                    } else if (data.type === 'error') {
+                        setStatus(`<strong>Error:</strong> ${data.message}`);
+                    }
+                } catch (e) {
+                    // Ignore parse errors
+                }
+            }
+        }
+    }
+    return currentStep;
+}
+
 async function autoplay() {
     if (isProcessing) return;
+
+    const totalRuns = parseInt(repeatInput.value) || 1;
 
     setProcessing(true);
     isAutoPlaying = true;
@@ -345,79 +434,40 @@ async function autoplay() {
     setStatus('<strong>Status:</strong> Auto-play starting...');
     modelBadge.textContent = `${providerSelect.value} - ${modelSelect.value}`;
 
-    // Show stop button
     stopBtn.style.display = 'block';
     resumeBtn.style.display = 'none';
 
-    let currentContent = '';
-    let currentStep = 0;
-
-    // Create abort controller for this request
     abortController = new AbortController();
 
     try {
-        const response = await fetch('/api/autoplay', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(getRequestData()),
-            signal: abortController.signal
-        });
+        for (let run = 1; run <= totalRuns; run++) {
+            if (abortController.signal.aborted) break;
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let lastMessageType = null;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const text = decoder.decode(value);
-            const lines = text.split('\n');
-
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    try {
-                        const data = JSON.parse(line.slice(6));
-
-                        if (data.type === 'status') {
-                            setStatus(`<strong>Status:</strong> ${data.message}`);
-                        } else if (data.type === 'chunk') {
-                            if (data.choice && lastMessageType !== 'user') {
-                                // Add player choice
-                                addMessage('user', data.choice.toString());
-                                addMessage('bot', '');
-                                currentContent = '';
-                                lastMessageType = 'user';
-                            } else if (!lastMessageType || lastMessageType === 'step_done') {
-                                // Start new bot message
-                                addMessage('bot', '');
-                                currentContent = '';
-                                lastMessageType = 'bot';
-                            }
-                            currentContent += data.content;
-                            updateLastBotMessage(currentContent);
-                        } else if (data.type === 'step_done') {
-                            currentStep = data.step;
-                            setStatus(`<strong>Status:</strong> Auto-play Step ${currentStep}/${stepsSlider.value}`);
-                            lastMessageType = 'step_done';
-                            currentContent = '';
-                            gameStarted = true;
-                        } else if (data.type === 'complete') {
-                            storyComplete = true;
-                            setStatus(`<strong>Status:</strong> Auto-play complete! (${data.step} steps) - Click "Continue Story" to keep playing`);
-                        } else if (data.type === 'error') {
-                            setStatus(`<strong>Error:</strong> ${data.message}`);
-                        }
-                    } catch (e) {
-                        // Ignore parse errors
-                    }
-                }
+            if (run > 1) {
+                // Add a visual separator between runs
+                const sep = document.createElement('div');
+                sep.className = 'message bot';
+                sep.style.opacity = '0.5';
+                sep.style.fontStyle = 'italic';
+                sep.textContent = `— Run ${run} of ${totalRuns} —`;
+                chatbox.appendChild(sep);
+                chatbox.scrollTop = chatbox.scrollHeight;
             }
+
+            await runSingleAutoplay(run, totalRuns);
+
+            if (abortController.signal.aborted) break;
+        }
+
+        if (!abortController.signal.aborted) {
+            storyComplete = true;
+            const runWord = totalRuns > 1 ? `${totalRuns} runs` : 'auto-play';
+            setStatus(`<strong>Status:</strong> ${runWord} complete! - Click "Continue Story" to keep playing`);
         }
     } catch (error) {
         if (error.name === 'AbortError') {
             autoplayStopped = true;
-            setStatus(`<strong>Status:</strong> Auto-play stopped at step ${currentStep}. Click "Resume" to continue auto-play or "Next Step" for manual.`);
+            setStatus(`<strong>Status:</strong> Auto-play stopped. Click "Resume" to continue or "Next Step" for manual.`);
         } else {
             setStatus(`<strong>Error:</strong> ${error.message}`);
         }

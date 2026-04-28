@@ -1,10 +1,12 @@
 """Flask-based RPG Chatbot Application"""
 import json
 import time
+import requests as http_requests
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 from config import Config
 from game_logic import GameState, ConversationFormatter
 from chatbot import ChatClient
+from prompts import PromptManager
 
 app = Flask(__name__)
 
@@ -57,15 +59,8 @@ def get_provider_config(provider_name: str) -> dict:
         },
         "Ollama (Local)": {
             "api_url": "http://localhost:11434/v1/chat/completions",
-            "default_model": "llama3.1",
-            "models": [
-                "llama3.1",
-                "llama3:latest",
-                "mistral",
-                "codellama",
-                "vicuna",
-                "gemma:2b",
-            ],
+            "default_model": "",
+            "models": [],
             "requires_key": False,
             "provider": "ollama",
         },
@@ -110,17 +105,20 @@ def create_client(provider_name, model_name, api_url="", api_key=""):
     return client
 
 
-def _default_gm_prompt() -> str:
-    return (
-        "You are a vivid and safety-conscious RPG Game Master. "
-        "Set each scene with clear, engaging description (about 3–4 lines). "
-        "Always end your response with exactly four numbered choices (1–4), "
-        "each being concise, meaningful, and distinct."
-    )
-
-
-def _default_player_prompt() -> str:
-    return "You are the Player. Your choices are numbers 1-4 responding to the GM options."
+@app.route('/api/ollama/models')
+def get_ollama_models():
+    """Return installed Ollama models, with .env override support"""
+    if Config.OLLAMA_MODELS:
+        models = [m.strip() for m in Config.OLLAMA_MODELS.split(',') if m.strip()]
+        return jsonify({'models': models, 'default_model': models[0] if models else ''})
+    try:
+        resp = http_requests.get('http://localhost:11434/api/tags', timeout=3)
+        resp.raise_for_status()
+        data = resp.json()
+        models = [m['name'] for m in data.get('models', [])]
+        return jsonify({'models': models, 'default_model': models[0] if models else ''})
+    except Exception as e:
+        return jsonify({'models': [], 'default_model': '', 'error': str(e)})
 
 
 @app.route('/')
@@ -159,8 +157,7 @@ def start_game():
     def generate():
         try:
             client = create_client(provider, model, api_url, api_key)
-            gm_prompt = _default_gm_prompt()
-            player_prompt = _default_player_prompt()
+            gm_prompt, player_prompt = PromptManager.load_all_prompts()
             game = GameState(gm_prompt, player_prompt, chat_client=client)
             game_sessions[session_id] = game
 
@@ -231,8 +228,7 @@ def autoplay():
     def generate():
         try:
             client = create_client(provider, model, api_url, api_key)
-            gm_prompt = _default_gm_prompt()
-            player_prompt = _default_player_prompt()
+            gm_prompt, player_prompt = PromptManager.load_all_prompts()
             game = GameState(gm_prompt, player_prompt, chat_client=client)
             game_sessions[session_id] = game
 
