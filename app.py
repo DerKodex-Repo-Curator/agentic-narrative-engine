@@ -1,10 +1,12 @@
 """Flask-based RPG Chatbot Application"""
 import json
 import time
+import requests as http_requests
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 from config import Config
 from game_logic import GameState, ConversationFormatter
 from chatbot import ChatClient
+from prompts import PromptManager
 
 app = Flask(__name__)
 
@@ -18,74 +20,82 @@ def get_provider_config(provider_name: str) -> dict:
         "OpenAI (GPT)": {
             "api_url": "https://api.openai.com/v1/chat/completions",
             "default_model": "gpt-4o-mini",
-            "models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
+            "models": ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"],
             "requires_key": True,
             "provider": "openai",
+            "timeout": (10, 60),
         },
         "Anthropic (Claude)": {
             "api_url": "https://api.anthropic.com/v1/messages",
-            "default_model": "claude-3-haiku-20240307",
+            "default_model": "claude-haiku-5-5",
             "models": [
-                "claude-3-5-sonnet-20241022",
-                "claude-3-haiku-20240307",
-                "claude-3-opus-20240229",
+                "claude-haiku-5-5",
+                "claude-sonnet-5-5",
+                "claude-opus-5-5",
             ],
             "requires_key": True,
             "provider": "anthropic",
+            "timeout": (10, 60),
         },
         "Google (Gemini)": {
             "api_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-            "default_model": "gemini-2.0-flash",
+            "default_model": "gemini-2.5-flash",
             "models": [
+                "gemini-2.5-flash",
                 "gemini-2.5-flash-lite",
-                "gemini-2.0-flash",
-                "gemini-2.0-flash-lite",
+                "gemini-2.5-pro",
             ],
             "requires_key": True,
             "provider": "gemini",
+            "timeout": (10, 60),
         },
         "DeepSeek": {
             "api_url": "https://api.deepseek.com/chat/completions",
             "default_model": "deepseek-chat",
-            "models": [
-                "deepseek-chat",
-                "deepseek-coder",
-                "deepseek-reasoner",
-            ],
+            "models": ["deepseek-chat", "deepseek-reasoner"],
             "requires_key": True,
             "provider": "deepseek",
+            "timeout": (10, 120),
         },
         "Ollama (Local)": {
             "api_url": "http://localhost:11434/v1/chat/completions",
             "default_model": "llama3.1",
             "models": [
                 "llama3.1",
-                "llama3:latest",
+                "llama3.2",
+                "llama3.3",
                 "mistral",
+                "gemma3",
+                "qwen3",
+                "deepseek-r1",
+                "phi4",
                 "codellama",
-                "vicuna",
-                "gemma:2b",
+                "gpt-oss"
             ],
             "requires_key": False,
             "provider": "ollama",
+            "timeout": (10, 300),  # local models can be slow on first load
         },
         "Groq": {
-            "api_url": "https://api.groq.com/openai/v1/chat/completions",
-            "default_model": "llama-3.1-8b-instant",
-            "models": [
-                "llama-3.1-8b-instant",
-                "meta-llama/llama-4-scout-17b-16e-instruct",
-                "gemma2-9b-it",
-            ],
-            "requires_key": True,
-            "provider": "groq",
-        },
+    "api_url": "https://api.groq.com/openai/v1/chat/completions",
+    "default_model": "llama-3.1-8b-instant",
+    "models": [
+        "llama-3.1-8b-instant",
+        "llama-3.3-70b-versatile",
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b",
+    ],
+    "requires_key": True,
+    "provider": "groq",
+    "timeout": (10, 60),
+},
         "LM Studio": {
             "api_url": "http://localhost:1234/v1/chat/completions",
             "default_model": "local-model",
             "models": ["local-model"],
             "requires_key": False,
             "provider": "lmstudio",
+            "timeout": (10, 300),
         },
         "Custom Provider": {
             "api_url": "",
@@ -93,6 +103,7 @@ def get_provider_config(provider_name: str) -> dict:
             "models": ["custom-model"],
             "requires_key": True,
             "provider": "custom",
+            "timeout": (10, 120),
         },
     }
     return provider_configs.get(provider_name, provider_configs["Custom Provider"])
@@ -107,20 +118,24 @@ def create_client(provider_name, model_name, api_url="", api_key=""):
     client.api_url = url
     client.api_key = api_key.strip() if api_key else ""
     client.api_provider = provider_config["provider"]
+    client.timeout = provider_config["timeout"]
     return client
 
 
-def _default_gm_prompt() -> str:
-    return (
-        "You are a vivid and safety-conscious RPG Game Master. "
-        "Set each scene with clear, engaging description (about 3–4 lines). "
-        "Always end your response with exactly four numbered choices (1–4), "
-        "each being concise, meaningful, and distinct."
-    )
-
-
-def _default_player_prompt() -> str:
-    return "You are the Player. Your choices are numbers 1-4 responding to the GM options."
+@app.route('/api/ollama/models')
+def get_ollama_models():
+    """Return installed Ollama models, with .env override support"""
+    if Config.OLLAMA_MODELS:
+        models = [m.strip() for m in Config.OLLAMA_MODELS.split(',') if m.strip()]
+        return jsonify({'models': models, 'default_model': models[0] if models else ''})
+    try:
+        resp = http_requests.get('http://localhost:11434/api/tags', timeout=3)
+        resp.raise_for_status()
+        data = resp.json()
+        models = [m['name'] for m in data.get('models', [])]
+        return jsonify({'models': models, 'default_model': models[0] if models else ''})
+    except Exception as e:
+        return jsonify({'models': [], 'default_model': '', 'error': str(e)})
 
 
 @app.route('/')
@@ -159,8 +174,7 @@ def start_game():
     def generate():
         try:
             client = create_client(provider, model, api_url, api_key)
-            gm_prompt = _default_gm_prompt()
-            player_prompt = _default_player_prompt()
+            gm_prompt, player_prompt = PromptManager.load_all_prompts()
             game = GameState(gm_prompt, player_prompt, chat_client=client)
             game_sessions[session_id] = game
 
@@ -231,8 +245,7 @@ def autoplay():
     def generate():
         try:
             client = create_client(provider, model, api_url, api_key)
-            gm_prompt = _default_gm_prompt()
-            player_prompt = _default_player_prompt()
+            gm_prompt, player_prompt = PromptManager.load_all_prompts()
             game = GameState(gm_prompt, player_prompt, chat_client=client)
             game_sessions[session_id] = game
 

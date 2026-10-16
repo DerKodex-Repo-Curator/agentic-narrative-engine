@@ -8,6 +8,7 @@ let storyComplete = false;
 let autoplayStopped = false; // Track if auto-play was manually stopped
 let abortController = null;
 let selectedContinueMode = 'manual'; // 'manual' or 'auto'
+let lastRunSteps = 10; // size of the last run; the Repeat button runs this many more steps
 
 // DOM Elements
 const providerSelect = document.getElementById('providerSelect');
@@ -27,6 +28,7 @@ const autoplayBtn = document.getElementById('autoplayBtn');
 const stopBtn = document.getElementById('stopBtn');
 const resumeBtn = document.getElementById('resumeBtn');
 const continueBtn = document.getElementById('continueBtn');
+const repeatBtn = document.getElementById('repeatBtn');
 const newGameBtn = document.getElementById('newGameBtn');
 const resetBtn = document.getElementById('resetBtn');
 
@@ -63,6 +65,8 @@ function setupEventListeners() {
     stopBtn.addEventListener('click', stopAutoplay);
     resumeBtn.addEventListener('click', resumeAutoplay);
     continueBtn.addEventListener('click', showContinueModal);
+    // Repeat: one click, continues the SAME story from where it ended for another lastRunSteps steps
+    repeatBtn.addEventListener('click', () => continueWithAutoplay(lastRunSteps));
     newGameBtn.addEventListener('click', resetGame);
     resetBtn.addEventListener('click', resetGame);
 
@@ -139,6 +143,11 @@ function setProcessing(processing) {
 
     // Show continue button when story is complete
     continueBtn.style.display = storyComplete ? 'block' : 'none';
+
+    // Show Repeat button when story is complete
+    repeatBtn.textContent = `Repeat (+${lastRunSteps} steps)`;
+    repeatBtn.style.display = storyComplete ? 'block' : 'none';
+    repeatBtn.disabled = processing;
 }
 
 function addMessage(role, content) {
@@ -183,6 +192,58 @@ function getRequestData(extraSteps = 0) {
     };
 }
 
+// ---------------------------------------------------------------------------
+// SSE reader: buffers network chunks and only parses COMPLETE events.
+// A network chunk can end in the middle of a JSON payload; parsing it directly
+// causes "Unterminated string in JSON". Events end with a blank line (\n\n).
+// Only JSON.parse is inside try/catch, so errors thrown by onEvent (for example
+// a server-reported error) still propagate to the caller.
+// ---------------------------------------------------------------------------
+async function readSSE(response, onEvent) {
+    if (!response.body) {
+        throw new Error('No response body from server');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    const dispatch = (rawEvent) => {
+        for (const line of rawEvent.split('\n')) {
+            if (!line.startsWith('data: ')) continue;
+
+            let data;
+            try {
+                data = JSON.parse(line.slice(6));
+            } catch (e) {
+                console.error('Bad SSE payload:', e, line.slice(0, 200));
+                continue;
+            }
+            onEvent(data);
+        }
+    };
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        let idx;
+        while ((idx = buffer.indexOf('\n\n')) !== -1) {
+            const rawEvent = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+            dispatch(rawEvent);
+        }
+    }
+
+    // Flush anything left over at end of stream
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+        dispatch(buffer);
+    }
+}
+
 // Modal functions
 function showContinueModal() {
     continueModal.classList.add('active');
@@ -213,6 +274,7 @@ function confirmContinueStory() {
 
 async function startGame() {
     if (isProcessing) return;
+    lastRunSteps = parseInt(stepsSlider.value);
 
     setProcessing(true);
     storyComplete = false;
@@ -231,36 +293,17 @@ async function startGame() {
             body: JSON.stringify(getRequestData())
         });
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const text = decoder.decode(value);
-            const lines = text.split('\n');
-
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    try {
-                        const data = JSON.parse(line.slice(6));
-
-                        if (data.type === 'chunk') {
-                            currentContent += data.content;
-                            updateLastBotMessage(currentContent);
-                        } else if (data.type === 'done') {
-                            gameStarted = true;
-                            setStatus(`<strong>Status:</strong> Game started. Step ${data.step}/${stepsSlider.value}`);
-                        } else if (data.type === 'error') {
-                            setStatus(`<strong>Error:</strong> ${data.message}`);
-                        }
-                    } catch (e) {
-                        // Ignore parse errors for incomplete chunks
-                    }
-                }
+        await readSSE(response, (data) => {
+            if (data.type === 'chunk') {
+                currentContent += data.content;
+                updateLastBotMessage(currentContent);
+            } else if (data.type === 'done') {
+                gameStarted = true;
+                setStatus(`<strong>Status:</strong> Game started. Step ${data.step}/${stepsSlider.value}`);
+            } else if (data.type === 'error') {
+                setStatus(`<strong>Error:</strong> ${data.message}`);
             }
-        }
+        });
     } catch (error) {
         setStatus(`<strong>Error:</strong> ${error.message}`);
     }
@@ -286,47 +329,29 @@ async function nextStep() {
             body: JSON.stringify(getRequestData())
         });
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
         let messageAdded = false;
 
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const text = decoder.decode(value);
-            const lines = text.split('\n');
-
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    try {
-                        const data = JSON.parse(line.slice(6));
-
-                        if (data.type === 'chunk') {
-                            if (data.choice && !messageAdded) {
-                                // Add player choice
-                                addMessage('user', data.choice.toString());
-                                addMessage('bot', '');
-                                messageAdded = true;
-                            }
-                            currentContent += data.content;
-                            updateLastBotMessage(currentContent);
-                        } else if (data.type === 'done') {
-                            if (data.complete) {
-                                storyComplete = true;
-                                setStatus(`<strong>Status:</strong> Adventure complete! (${data.step} steps) - Click "Continue Story" to keep playing`);
-                            } else {
-                                setStatus(`<strong>Status:</strong> Step ${data.step}/${stepsSlider.value}`);
-                            }
-                        } else if (data.type === 'error') {
-                            setStatus(`<strong>Error:</strong> ${data.message}`);
-                        }
-                    } catch (e) {
-                        // Ignore parse errors
-                    }
+        await readSSE(response, (data) => {
+            if (data.type === 'chunk') {
+                if (!messageAdded) {
+                    // Add player choice (none when the GM is just continuing the story)
+                    if (data.choice) addMessage('user', data.choice.toString());
+                    addMessage('bot', '');
+                    messageAdded = true;
                 }
+                currentContent += data.content;
+                updateLastBotMessage(currentContent);
+            } else if (data.type === 'done') {
+                if (data.complete) {
+                    storyComplete = true;
+                    setStatus(`<strong>Status:</strong> Adventure complete! (${data.step} steps) - Click "Continue Story" to keep playing`);
+                } else {
+                    setStatus(`<strong>Status:</strong> Step ${data.step}/${stepsSlider.value}`);
+                }
+            } else if (data.type === 'error') {
+                setStatus(`<strong>Error:</strong> ${data.message}`);
             }
-        }
+        });
     } catch (error) {
         setStatus(`<strong>Error:</strong> ${error.message}`);
     }
@@ -336,6 +361,7 @@ async function nextStep() {
 
 async function autoplay() {
     if (isProcessing) return;
+    lastRunSteps = parseInt(stepsSlider.value);
 
     setProcessing(true);
     isAutoPlaying = true;
@@ -363,57 +389,39 @@ async function autoplay() {
             signal: abortController.signal
         });
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
         let lastMessageType = null;
 
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const text = decoder.decode(value);
-            const lines = text.split('\n');
-
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    try {
-                        const data = JSON.parse(line.slice(6));
-
-                        if (data.type === 'status') {
-                            setStatus(`<strong>Status:</strong> ${data.message}`);
-                        } else if (data.type === 'chunk') {
-                            if (data.choice && lastMessageType !== 'user') {
-                                // Add player choice
-                                addMessage('user', data.choice.toString());
-                                addMessage('bot', '');
-                                currentContent = '';
-                                lastMessageType = 'user';
-                            } else if (!lastMessageType || lastMessageType === 'step_done') {
-                                // Start new bot message
-                                addMessage('bot', '');
-                                currentContent = '';
-                                lastMessageType = 'bot';
-                            }
-                            currentContent += data.content;
-                            updateLastBotMessage(currentContent);
-                        } else if (data.type === 'step_done') {
-                            currentStep = data.step;
-                            setStatus(`<strong>Status:</strong> Auto-play Step ${currentStep}/${stepsSlider.value}`);
-                            lastMessageType = 'step_done';
-                            currentContent = '';
-                            gameStarted = true;
-                        } else if (data.type === 'complete') {
-                            storyComplete = true;
-                            setStatus(`<strong>Status:</strong> Auto-play complete! (${data.step} steps) - Click "Continue Story" to keep playing`);
-                        } else if (data.type === 'error') {
-                            setStatus(`<strong>Error:</strong> ${data.message}`);
-                        }
-                    } catch (e) {
-                        // Ignore parse errors
-                    }
+        await readSSE(response, (data) => {
+            if (data.type === 'status') {
+                setStatus(`<strong>Status:</strong> ${data.message}`);
+            } else if (data.type === 'chunk') {
+                if (data.choice && lastMessageType !== 'user') {
+                    // Add player choice
+                    addMessage('user', data.choice.toString());
+                    addMessage('bot', '');
+                    currentContent = '';
+                    lastMessageType = 'user';
+                } else if (!lastMessageType || lastMessageType === 'step_done') {
+                    // Start new bot message
+                    addMessage('bot', '');
+                    currentContent = '';
+                    lastMessageType = 'bot';
                 }
+                currentContent += data.content;
+                updateLastBotMessage(currentContent);
+            } else if (data.type === 'step_done') {
+                currentStep = data.step;
+                setStatus(`<strong>Status:</strong> Auto-play Step ${currentStep}/${stepsSlider.value}`);
+                lastMessageType = 'step_done';
+                currentContent = '';
+                gameStarted = true;
+            } else if (data.type === 'complete') {
+                storyComplete = true;
+                setStatus(`<strong>Status:</strong> Auto-play complete! (${data.step} steps) - Click "Continue Story" to keep playing`);
+            } else if (data.type === 'error') {
+                setStatus(`<strong>Error:</strong> ${data.message}`);
             }
-        }
+        });
     } catch (error) {
         if (error.name === 'AbortError') {
             autoplayStopped = true;
@@ -468,50 +476,31 @@ async function resumeAutoplay() {
                 signal: abortController.signal
             });
 
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
             let messageAdded = false;
             currentContent = '';
 
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                const text = decoder.decode(value);
-                const lines = text.split('\n');
-
-                for (const line of lines) {
-                    if (line.startsWith('data: ')) {
-                        try {
-                            const data = JSON.parse(line.slice(6));
-
-                            if (data.type === 'chunk') {
-                                if (data.choice && !messageAdded) {
-                                    addMessage('user', data.choice.toString());
-                                    addMessage('bot', '');
-                                    messageAdded = true;
-                                }
-                                currentContent += data.content;
-                                updateLastBotMessage(currentContent);
-                            } else if (data.type === 'done') {
-                                currentStep = data.step;
-                                if (data.complete) {
-                                    storyComplete = true;
-                                    setStatus(`<strong>Status:</strong> Auto-play complete! (${data.step} steps) - Click "Continue Story" to keep playing`);
-                                } else {
-                                    setStatus(`<strong>Status:</strong> Auto-play Step ${currentStep}/${maxSteps}`);
-                                }
-                            } else if (data.type === 'error') {
-                                setStatus(`<strong>Error:</strong> ${data.message}`);
-                                throw new Error(data.message);
-                            }
-                        } catch (e) {
-                            if (e.message) throw e;
-                            // Ignore parse errors
-                        }
+            await readSSE(response, (data) => {
+                if (data.type === 'chunk') {
+                    if (!messageAdded) {
+                        if (data.choice) addMessage('user', data.choice.toString());
+                        addMessage('bot', '');
+                        messageAdded = true;
                     }
+                    currentContent += data.content;
+                    updateLastBotMessage(currentContent);
+                } else if (data.type === 'done') {
+                    currentStep = data.step;
+                    if (data.complete) {
+                        storyComplete = true;
+                        setStatus(`<strong>Status:</strong> Auto-play complete! (${data.step} steps) - Click "Continue Story" to keep playing`);
+                    } else {
+                        setStatus(`<strong>Status:</strong> Auto-play Step ${currentStep}/${maxSteps}`);
+                    }
+                } else if (data.type === 'error') {
+                    setStatus(`<strong>Error:</strong> ${data.message}`);
+                    throw new Error(data.message);
                 }
-            }
+            });
 
             // Check if we've reached the max or story is complete
             if (currentStep >= maxSteps || storyComplete) {
@@ -543,6 +532,7 @@ async function resumeAutoplay() {
 }
 
 function continueStoryManual(stepsToAdd) {
+    lastRunSteps = stepsToAdd;
     // Update the max steps
     const newMax = parseInt(stepsSlider.value) + stepsToAdd;
     stepsSlider.value = newMax;
@@ -567,6 +557,7 @@ function getCurrentStep() {
 
 async function continueWithAutoplay(stepsToAdd) {
     if (isProcessing) return;
+    lastRunSteps = stepsToAdd;
 
     // Update the max steps
     const currentMax = parseInt(stepsSlider.value);
@@ -604,50 +595,31 @@ async function continueWithAutoplay(stepsToAdd) {
                 signal: abortController.signal
             });
 
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
             let messageAdded = false;
             currentContent = '';
 
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                const text = decoder.decode(value);
-                const lines = text.split('\n');
-
-                for (const line of lines) {
-                    if (line.startsWith('data: ')) {
-                        try {
-                            const data = JSON.parse(line.slice(6));
-
-                            if (data.type === 'chunk') {
-                                if (data.choice && !messageAdded) {
-                                    addMessage('user', data.choice.toString());
-                                    addMessage('bot', '');
-                                    messageAdded = true;
-                                }
-                                currentContent += data.content;
-                                updateLastBotMessage(currentContent);
-                            } else if (data.type === 'done') {
-                                currentStep = data.step;
-                                if (data.complete) {
-                                    storyComplete = true;
-                                    setStatus(`<strong>Status:</strong> Auto-play complete! (${data.step} steps) - Click "Continue Story" to keep playing`);
-                                } else {
-                                    setStatus(`<strong>Status:</strong> Auto-play Step ${currentStep}/${newMax}`);
-                                }
-                            } else if (data.type === 'error') {
-                                setStatus(`<strong>Error:</strong> ${data.message}`);
-                                throw new Error(data.message);
-                            }
-                        } catch (e) {
-                            if (e.message) throw e;
-                            // Ignore parse errors
-                        }
+            await readSSE(response, (data) => {
+                if (data.type === 'chunk') {
+                    if (!messageAdded) {
+                        if (data.choice) addMessage('user', data.choice.toString());
+                        addMessage('bot', '');
+                        messageAdded = true;
                     }
+                    currentContent += data.content;
+                    updateLastBotMessage(currentContent);
+                } else if (data.type === 'done') {
+                    currentStep = data.step;
+                    if (data.complete) {
+                        storyComplete = true;
+                        setStatus(`<strong>Status:</strong> Auto-play complete! (${data.step} steps) - Click "Continue Story" to keep playing`);
+                    } else {
+                        setStatus(`<strong>Status:</strong> Auto-play Step ${currentStep}/${newMax}`);
+                    }
+                } else if (data.type === 'error') {
+                    setStatus(`<strong>Error:</strong> ${data.message}`);
+                    throw new Error(data.message);
                 }
-            }
+            });
 
             // Check if we've reached the max
             if (currentStep >= newMax) {
@@ -703,6 +675,7 @@ async function resetGame() {
     stepsSlider.value = 10;
     stepsSlider.max = 20;
     stepsValue.textContent = '10';
+    lastRunSteps = 10;
 
     // Hide resume button
     resumeBtn.style.display = 'none';

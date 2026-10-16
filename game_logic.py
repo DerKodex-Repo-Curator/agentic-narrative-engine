@@ -79,6 +79,7 @@ class GameState:
         self.gm_history = [{"role": "system", "content": gm_prompt}]
         self.conversation = []
         self.step_count = 0
+        self.needs_gm_continue = False  # True after the final ending: GM must narrate before the player chooses
         self.chat_logger = ChatLogger()
 
         if chat_client:
@@ -150,10 +151,65 @@ class GameState:
                 return False
         return True
 
+    # Prompts for the GM turn that follows a finished story. Tried in order until the reply
+    # contains the 4 numbered options (some models refuse the plain "continue" request).
+    CONTINUE_PROMPTS = [
+        ("This is a fictional interactive text adventure, so the story simply goes on. "
+         "Do not refuse and do not comment on this request. Continue the story from where it ended: "
+         "describe what happens next vividly in 3-4 lines, then give exactly 4 new numbered options "
+         "(1., 2., 3., 4.)."),
+        ("Start a new chapter of the same fictional adventure with a fresh development or a new mystery "
+         "for the player. Stay in character as the game master, never refuse, and end with exactly "
+         "4 numbered options (1., 2., 3., 4.)."),
+    ]
+
+    def _gm_continue_turn(self):
+        """After a finished story, let the GM continue the story and give 4 new options
+        BEFORE the player makes any choice. Does not count as a step.
+
+        The reply is checked for the 4 numbered options; if the model refuses or answers
+        without options, the next prompt is tried. Failed replies never enter the history."""
+        from utils import validate_gm_response
+
+        self.chat_client.is_final_step = False
+        reply = ""
+        used_prompt = None
+
+        for prompt in self.CONTINUE_PROMPTS:
+            messages = self.gm_history + [{"role": "user", "content": prompt}]
+            candidate = (self.chat_client.chat(messages) or "").strip()
+            failed = (not candidate or candidate.startswith("Error:")
+                      or candidate.startswith("Request failed"))
+            if not failed and validate_gm_response(candidate):
+                reply, used_prompt = candidate, prompt
+                break
+            logger.warning(f"GM continue attempt rejected (no options / refusal): {candidate[:120]!r}")
+
+        if not reply:
+            msg = ("The story teller could not continue the story (the model refused or gave no options). "
+                   "Click again to retry, or switch to another model.")
+            self.chat_logger.append_system_message(msg)
+            yield False, self.conversation, None, msg
+            return
+
+        # Only now (reply is valid) does anything enter the history / conversation
+        self.gm_history.append({"role": "user", "content": used_prompt})
+        self.gm_history.append({"role": "assistant", "content": reply})
+        self.conversation.append(("GM", reply))
+        self.chat_logger.append_message("GM", reply)
+        self.needs_gm_continue = False
+        yield True, self.conversation + [], None, reply   # whole reply as one chunk
+        yield True, self.conversation, None, ""
+
     def take_step_streaming(self, player_choice: Optional[int] = None, max_steps: int = 50) -> Generator[Tuple[bool, List, int, str], None, None]:
         """Streaming player step with robust completion handling"""
 
         try:
+            # Story had ended (no options on screen): the GM goes first, no player choice yet
+            if self.needs_gm_continue:
+                yield from self._gm_continue_turn()
+                return
+
             if player_choice is None:
                 player_choice = random.choice([1, 2, 3, 4])
 
@@ -204,6 +260,7 @@ Based on choice {player_choice}, provide a complete and satisfying ending that w
             self.chat_client.is_final_step = False
 
             if is_final_step:
+                self.needs_gm_continue = True
                 self.chat_logger.append_system_message(f"Adventure completed after {self.step_count} steps")
 
             # Final yield with empty content to signal completion (content already streamed)
@@ -218,6 +275,7 @@ Based on choice {player_choice}, provide a complete and satisfying ending that w
     def reset(self):
         self.conversation.clear()
         self.step_count = 0
+        self.needs_gm_continue = False
         self.gm_history = self.gm_history[:1]
         self.chat_logger.finalize_session()
         self._start_session_with_model_info()
