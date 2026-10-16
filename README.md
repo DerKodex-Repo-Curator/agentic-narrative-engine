@@ -13,7 +13,7 @@ A real-time streaming RPG chatbot with **multi-provider support** that creates i
 * **Multi-Provider Support**: Works with OpenAI, Anthropic, Ollama, Groq, LM Studio, and more
 * **Dynamic Provider Switching**: Change AI providers and models during gameplay
 * **Interactive RPG**: Dynamic story with player choices and intelligent final step handling
-* **Auto-play Mode**: Watch AI vs AI gameplay with configurable delays
+* **Auto-play Mode**: Watch AI vs AI gameplay with configurable delays and repeat count
 * **Cross-Platform**: Works consistently on Mac, Windows, and Linux
 * **Modern UI**: Clean, professional interface inspired by ChatGPT/Claude with dark sidebar
 
@@ -22,7 +22,7 @@ A real-time streaming RPG chatbot with **multi-provider support** that creates i
 * **Anthropic** (Claude-3.5 Sonnet, Claude-3 Haiku, Claude-3 Opus)
 * **Google** (Gemini 2.5 Flash-Lite, Gemini 2.0 Flash)
 * **DeepSeek** (DeepSeek Chat, DeepSeek Coder, DeepSeek Reasoner)
-* **Ollama** (Local: Llama 3.1, Mistral, CodeLlama, Vicuna, Gemma)
+* **Ollama** (Local: auto-detects all installed models)
 * **Groq** (Fast inference: Llama, Mixtral, Gemma models)
 * **LM Studio** (Local model server)
 * **Custom Providers** (Any OpenAI-compatible API)
@@ -62,24 +62,24 @@ ollama serve
    pip install -r requirements.txt
    ```
 
-3. **Configure Environment Variables** (Optional - can set via UI)
+3. **Configure Environment Variables**
    ```bash
-   cp .env.example .env
+   # A .env file is included with sensible defaults.
+   # Open it and fill in whichever API key(s) you need.
    ```
 
-   Example `.env` configuration:
+   Key `.env` options:
    ```env
-   # OpenAI
+   # API Keys
    OPENAI_API_KEY=your_openai_key_here
-
-   # Anthropic
    ANTHROPIC_API_KEY=your_anthropic_key_here
-
-   # Groq
    GROQ_API_KEY=your_groq_key_here
 
-   # Generic fallback
-   API_KEY=your_api_key_here
+   # Ollama: leave empty to auto-detect, or set a fixed list
+   OLLAMA_MODELS=llama3.1,mistral,gemma:2b
+
+   # Auto-play: number of full runs back-to-back
+   AUTOPLAY_REPEAT=1
    ```
 
 4. **Run the Application**
@@ -113,6 +113,7 @@ ollama serve
 #### Auto-play Mode
 * Click "Auto-play" for hands-free adventure
 * Set delay between steps (0-10 seconds)
+* Set **repeat count** (1-10x) to run multiple full adventures back-to-back
 * Perfect for demonstrations or relaxed gameplay
 * Watch AI make choices and respond automatically
 
@@ -121,6 +122,8 @@ ollama serve
 * **Start Adventure**: Begin a new game
 * **Next Step**: Take the next step in the adventure
 * **Auto-play**: Let the AI play automatically
+* **Stop / Resume**: Pause and resume auto-play mid-run
+* **Continue Story**: Extend the adventure after it completes
 
 ## Project Structure
 
@@ -141,11 +144,10 @@ roleplay-chatbot/
 │       └── app.js        # Frontend JavaScript (streaming, interactions)
 │
 ├── requirements.txt      # Python dependencies
-├── .env.example          # Template for environment variables
+├── .env                  # Environment variables (edit this)
 │
-├── prompts/              # Customizable prompt templates
-│   ├── gm_prompt.txt     # Game Master instructions
-│   └── rp_prompt.txt     # Player role instructions
+├── gm_prompt.txt         # Game Master instructions (edit to customise)
+├── rp_prompt.txt         # Player role instructions (edit to customise)
 │
 ├── chat_logs/            # Auto-saved conversation logs (.txt files)
 │
@@ -162,30 +164,51 @@ roleplay-chatbot/
 | **Anthropic (Claude)** | `https://api.anthropic.com/v1/messages` | `claude-3-haiku-20240307` | Yes |
 | **Google (Gemini)** | `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions` | `gemini-2.0-flash` | Yes |
 | **DeepSeek** | `https://api.deepseek.com/chat/completions` | `deepseek-chat` | Yes |
-| **Ollama (Local)** | `http://localhost:11434/v1/chat/completions` | `llama3.1` | No |
+| **Ollama (Local)** | `http://localhost:11434/v1/chat/completions` | auto-detected | No |
 | **Groq** | `https://api.groq.com/openai/v1/chat/completions` | `llama-3.1-8b-instant` | Yes |
 | **LM Studio** | `http://localhost:1234/v1/chat/completions` | `local-model` | No |
 
 ### Environment Variables
 
-| Variable            | Default                    | Description                                  |
-|---------------------|----------------------------|----------------------------------------------|
-| `API_PROVIDER`      | auto                       | API provider (auto-detected)                |
-| `API_URL`           | varies by provider         | API endpoint URL                             |
-| `MODEL`             | varies by provider         | AI model name                                |
-| `API_KEY`           | None                       | API key for authentication                   |
-| `SERVER_HOST`       | 127.0.0.1                  | Flask server host                            |
-| `SERVER_PORT`       | 7860                       | Flask server port                            |
-| `DEFAULT_MAX_STEPS` | 5                          | Default number of game steps                 |
-| `MAX_STEPS_LIMIT`   | 20                         | Maximum allowed steps                        |
-| `DEFAULT_DELAY`     | 2                          | Default delay between steps (seconds)        |
-| `MAX_DELAY`         | 10                         | Maximum delay between steps                  |
+| Variable            | Default          | Description                                                   |
+|---------------------|------------------|---------------------------------------------------------------|
+| `API_PROVIDER`      | `auto`           | API provider (auto-detected from URL/model)                  |
+| `API_URL`           | varies           | API endpoint URL                                              |
+| `MODEL`             | varies           | AI model name                                                 |
+| `API_KEY`           | —                | Generic API key fallback                                      |
+| `OPENAI_API_KEY`    | —                | OpenAI API key                                                |
+| `ANTHROPIC_API_KEY` | —                | Anthropic API key                                             |
+| `GROQ_API_KEY`      | —                | Groq API key                                                  |
+| `SERVER_HOST`       | `localhost`      | Flask server host                                             |
+| `SERVER_PORT`       | `7860`           | Flask server port                                             |
+| `DEFAULT_MAX_STEPS` | `10`             | Default number of game steps                                  |
+| `MAX_STEPS_LIMIT`   | `50`             | Maximum allowed steps                                         |
+| `DEFAULT_DELAY`     | `3`              | Default delay between auto-play steps (seconds)               |
+| `MAX_DELAY`         | `10`             | Maximum delay between steps                                   |
+| `AUTOPLAY_REPEAT`   | `1`              | How many full auto-play runs to execute back-to-back          |
+| `OLLAMA_MODELS`     | *(empty)*        | Comma-separated Ollama model override; leave empty to auto-detect |
+| `PROMPTS_DIR`       | `.`              | Directory containing prompt files                             |
+| `GM_PROMPT_FILE`    | `gm_prompt.txt`  | Filename for Game Master prompt                               |
+| `PLAYER_PROMPT_FILE`| `rp_prompt.txt`  | Filename for Player prompt                                    |
+| `AI_TEMPERATURE`    | `0.7`            | Model temperature (0.0–2.0)                                   |
+| `AI_MAX_TOKENS`     | `1000`           | Maximum tokens per response                                   |
+| `REQUEST_TIMEOUT`   | `30`             | API request timeout in seconds                                |
 
 ### Custom Prompts
 
-Customize the game experience by editing:
-* `prompts/gm_prompt.txt` - Instructions for the Game Master AI
-* `prompts/rp_prompt.txt` - Instructions for the Player AI (auto-play mode)
+The Game Master and Player prompts are loaded from files in the project root at startup. Edit them to change the tone, setting, or rules of the adventure:
+
+* `gm_prompt.txt` — Instructions for the Game Master AI
+* `rp_prompt.txt` — Instructions for the Player AI (used in auto-play mode)
+
+You can change the file locations via `.env`:
+```env
+PROMPTS_DIR=.
+GM_PROMPT_FILE=gm_prompt.txt
+PLAYER_PROMPT_FILE=rp_prompt.txt
+```
+
+If a file is missing or empty the app falls back to built-in default prompts automatically.
 
 ## Local AI Setup
 
@@ -198,7 +221,8 @@ ollama serve
 ```
 - URL: `http://localhost:11434/v1/chat/completions`
 - No API key required
-- Best for privacy and offline use
+- The model dropdown is **automatically populated** with all models you have installed
+- To override with a fixed list, set `OLLAMA_MODELS=model1,model2` in `.env`
 
 ### LM Studio
 1. Download LM Studio from their website
@@ -216,23 +240,33 @@ ollama serve
 * Check if local servers are running (`ollama serve`)
 * Try a different provider
 
+**Prompts not loading / falling back to defaults**
+* Check that `gm_prompt.txt` and `rp_prompt.txt` exist in the project root
+* Or set `PROMPTS_DIR`, `GM_PROMPT_FILE`, `PLAYER_PROMPT_FILE` in `.env`
+* Restart the server after any `.env` changes
+
+**Ollama showing no models**
+* Make sure `ollama serve` is running before starting the app
+* The app queries `http://localhost:11434/api/tags` on provider select
+* You can hardcode a list with `OLLAMA_MODELS=llama3.1,mistral` in `.env`
+
+**429 Too Many Requests (Google Gemini)**
+* Free tier has low rate limits — wait a moment and retry
+* Switch to Groq for a free, higher-rate alternative
+
 **Provider Issues**
 * Try switching providers via the sidebar dropdown
 * Test different models for your provider
 * Check API rate limits and billing status
 
-**Response Quality**
-* Try different models within the same provider
-* Adjust the number of steps for longer adventures
-
 ### Provider-Specific Support
 
-**OpenAI**: Check API billing and rate limits
-**Anthropic**: Verify API key and model access
-**Google Gemini**: Get API key from Google AI Studio (https://aistudio.google.com)
-**DeepSeek**: Get API key from DeepSeek platform (https://platform.deepseek.com)
-**Ollama**: Ensure `ollama serve` is running
-**Groq**: Check free tier limits
+**OpenAI**: Check API billing and rate limits  
+**Anthropic**: Verify API key and model access  
+**Google Gemini**: Get API key from Google AI Studio (https://aistudio.google.com)  
+**DeepSeek**: Get API key from DeepSeek platform (https://platform.deepseek.com)  
+**Ollama**: Ensure `ollama serve` is running  
+**Groq**: Check free tier limits (free tier available at console.groq.com)
 
 ## Requirements
 
