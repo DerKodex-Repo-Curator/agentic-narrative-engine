@@ -63,14 +63,8 @@ def get_provider_config(provider_name: str) -> dict:
             "models": [
                 "llama3.1",
                 "llama3.2",
-                "llama3.3",
                 "mistral",
-                "gemma3",
-                "qwen3",
-                "deepseek-r1",
-                "phi4",
-                "codellama",
-                "gpt-oss"
+                "gemma:2b",
             ],
             "requires_key": False,
             "provider": "ollama",
@@ -232,7 +226,8 @@ def next_step():
 
 @app.route('/api/autoplay', methods=['POST'])
 def autoplay():
-    """Auto-play the game"""
+    """Auto-play the game. With runs > 1 the game is reset and started again
+    automatically after each finished game (no user action in between)."""
     data = request.json
     max_steps = data.get('max_steps', 5)
     delay = data.get('delay', 1)
@@ -241,50 +236,66 @@ def autoplay():
     api_key = data.get('api_key', '')
     api_url = data.get('api_url', '')
     session_id = data.get('session_id', 'default')
+    runs = max(1, min(int(data.get('runs', 1) or 1), 101))   # 1 game + up to 100 repetitions
+    first_run = int(data.get('first_run', 1) or 1)
+    total_runs = int(data.get('total_runs', runs) or runs)
 
-    def generate():
-        try:
-            client = create_client(provider, model, api_url, api_key)
-            gm_prompt, player_prompt = PromptManager.load_all_prompts()
-            game = GameState(gm_prompt, player_prompt, chat_client=client)
-            game_sessions[session_id] = game
+    def sse(payload):
+        return f"data: {json.dumps(payload)}\n\n"
 
-            # Start game
-            yield f"data: {json.dumps({'type': 'status', 'message': 'Starting adventure...'})}\n\n"
+    def play_one_game(run_no):
+        """Plays one complete game. Returns False if an error stopped it."""
+        client = create_client(provider, model, api_url, api_key)
+        gm_prompt, player_prompt = PromptManager.load_all_prompts()
+        game = GameState(gm_prompt, player_prompt, chat_client=client)   # fresh game = reset
+        game_sessions[session_id] = game
 
-            for success, conversation, response in game.start_game_streaming():
+        yield sse({'type': 'run_start', 'run': run_no, 'total_runs': total_runs})
+        yield sse({'type': 'status', 'message': 'Starting adventure...', 'run': run_no})
+
+        for success, conversation, response in game.start_game_streaming():
+            if not success:
+                yield sse({'type': 'error', 'message': response, 'run': run_no})
+                return False
+            yield sse({'type': 'chunk', 'content': response, 'run': run_no,
+                       'conversation': ConversationFormatter.to_gradio_format(conversation)})
+
+        yield sse({'type': 'step_done', 'step': 0, 'run': run_no})
+
+        if delay > 0:
+            time.sleep(delay)
+
+        while game.step_count < max_steps:
+            yield sse({'type': 'status', 'message': f'Step {game.step_count + 1}/{max_steps}...', 'run': run_no})
+
+            for success, conversation, choice, response in game.take_step_streaming(max_steps=max_steps):
                 if not success:
-                    yield f"data: {json.dumps({'type': 'error', 'message': response})}\n\n"
-                    return
-                yield f"data: {json.dumps({'type': 'chunk', 'content': response, 'conversation': ConversationFormatter.to_gradio_format(conversation)})}\n\n"
+                    yield sse({'type': 'error', 'message': response, 'run': run_no})
+                    return False
+                yield sse({'type': 'chunk', 'content': response, 'choice': choice, 'run': run_no,
+                           'conversation': ConversationFormatter.to_gradio_format(conversation)})
 
-            yield f"data: {json.dumps({'type': 'step_done', 'step': 0})}\n\n"
+            yield sse({'type': 'step_done', 'step': game.step_count, 'run': run_no})
 
+            if game.step_count >= max_steps:
+                break
             if delay > 0:
                 time.sleep(delay)
 
-            # Auto-play steps
-            while game.step_count < max_steps:
-                yield f"data: {json.dumps({'type': 'status', 'message': f'Step {game.step_count + 1}/{max_steps}...'})}\n\n"
+        yield sse({'type': 'run_complete', 'run': run_no, 'total_runs': total_runs, 'step': game.step_count})
+        return True
 
-                for success, conversation, choice, response in game.take_step_streaming(max_steps=max_steps):
-                    if not success:
-                        yield f"data: {json.dumps({'type': 'error', 'message': response})}\n\n"
-                        return
-                    yield f"data: {json.dumps({'type': 'chunk', 'content': response, 'choice': choice, 'conversation': ConversationFormatter.to_gradio_format(conversation)})}\n\n"
-
-                yield f"data: {json.dumps({'type': 'step_done', 'step': game.step_count})}\n\n"
-
-                if game.step_count >= max_steps:
-                    break
-
-                if delay > 0:
+    def generate():
+        try:
+            for i in range(runs):
+                ok = yield from play_one_game(first_run + i)
+                if not ok:
+                    return
+                if i < runs - 1 and delay > 0:
                     time.sleep(delay)
-
-            yield f"data: {json.dumps({'type': 'complete', 'step': game.step_count})}\n\n"
-
+            yield sse({'type': 'complete', 'step': max_steps, 'runs': runs})
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield sse({'type': 'error', 'message': str(e)})
 
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
 

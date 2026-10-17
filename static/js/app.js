@@ -24,6 +24,8 @@ const stepsSlider = document.getElementById('stepsSlider');
 const stepsValue = document.getElementById('stepsValue');
 const delaySlider = document.getElementById('delaySlider');
 const delayValue = document.getElementById('delayValue');
+const repetitionsSlider = document.getElementById('repetitionsSlider');
+const repetitionsValue = document.getElementById('repetitionsValue');
 const chatbox = document.getElementById('chatbox');
 const statusBar = document.getElementById('statusBar');
 const modelBadge = document.getElementById('modelBadge');
@@ -34,7 +36,6 @@ const autoplayBtn = document.getElementById('autoplayBtn');
 const stopBtn = document.getElementById('stopBtn');
 const resumeBtn = document.getElementById('resumeBtn');
 const continueBtn = document.getElementById('continueBtn');
-const repeatBtn = document.getElementById('repeatBtn');
 const newGameBtn = document.getElementById('newGameBtn');
 const resetBtn = document.getElementById('resetBtn');
 
@@ -79,6 +80,7 @@ function setupEventListeners() {
     apiUrlInput.addEventListener('input', syncSettingsFromUI);
     stepsSlider.addEventListener('input', () => { updateSliderLabels(); syncSettingsFromUI(); });
     delaySlider.addEventListener('input', () => { updateSliderLabels(); syncSettingsFromUI(); });
+    repetitionsSlider.addEventListener('input', () => { updateSliderLabels(); syncSettingsFromUI(); });
 
     // Buttons (always act on the tab you are looking at)
     startBtn.addEventListener('click', () => startGame(activeTab()));
@@ -87,11 +89,6 @@ function setupEventListeners() {
     stopBtn.addEventListener('click', () => stopAutoplay(activeTab()));
     resumeBtn.addEventListener('click', () => resumeAutoplay(activeTab()));
     continueBtn.addEventListener('click', showContinueModal);
-    // Repeat: one click, continues the SAME story from where it ended for another lastRunSteps steps
-    repeatBtn.addEventListener('click', () => {
-        const tab = activeTab();
-        if (tab) continueWithAutoplay(tab, tab.lastRunSteps);
-    });
     newGameBtn.addEventListener('click', addTab);            // "+ New Game" = new tab in the app
     resetBtn.addEventListener('click', () => resetGame(activeTab()));
 
@@ -146,6 +143,7 @@ function readSettingsFromUI() {
         steps: parseInt(stepsSlider.value),
         stepsMax: parseInt(stepsSlider.max),
         delay: parseInt(delaySlider.value),
+        repetitions: parseInt(repetitionsSlider.value) || 0,
     };
 }
 
@@ -164,7 +162,9 @@ function createTab(settings) {
         hasError: false,
         abortController: null,
         currentStep: 0,
-        lastRunSteps: settings.steps, // size of the last run; the Repeat button runs this many more steps
+        totalRuns: 1,                 // games in the current auto-play series (1 + repetitions)
+        currentRun: 1,                // game of the series that is running / was running last
+        runsFinished: 0,              // games of the series that are completely finished
         epoch: 0,                     // bumped on reset/close so stale async code can detect it
         statusHtml: DEFAULT_STATUS,
     };
@@ -197,7 +197,7 @@ function addTab() {
     }
     // New game: same provider / model / key as the current tab, but a fresh 10-step game
     const base = current ? current.settings : readSettingsFromUI();
-    const tab = createTab({ ...base, steps: 10, stepsMax: 20 });
+    const tab = createTab({ ...base, steps: 10, stepsMax: 20, repetitions: 0 });
     switchTab(tab.id);
 }
 
@@ -347,6 +347,7 @@ async function applySettingsToUI(tab) {
     stepsSlider.max = s.stepsMax; // max first, then value
     stepsSlider.value = s.steps;
     delaySlider.value = s.delay;
+    repetitionsSlider.value = s.repetitions || 0;
     updateSliderLabels();
     updateBadge(tab);
 }
@@ -367,6 +368,7 @@ function updateBadge(tab) {
 function updateSliderLabels() {
     stepsValue.textContent = stepsSlider.value;
     delayValue.textContent = delaySlider.value;
+    repetitionsValue.textContent = repetitionsSlider.value;
 }
 
 function setTabSteps(tab, steps, max) {
@@ -408,11 +410,8 @@ function refreshControls() {
     // Show resume button when auto-play was stopped (and not complete)
     resumeBtn.style.display = (tab.autoplayStopped && !tab.storyComplete && !tab.isAutoPlaying) ? 'block' : 'none';
 
-    // Show continue + repeat buttons when story is complete
+    // Show continue button when story is complete
     continueBtn.style.display = tab.storyComplete ? 'block' : 'none';
-    repeatBtn.textContent = `Play ${tab.lastRunSteps} More Step${tab.lastRunSteps === 1 ? '' : 's'}`;
-    repeatBtn.style.display = tab.storyComplete ? 'block' : 'none';
-    repeatBtn.disabled = tab.isProcessing;
 }
 
 function addMessage(tab, role, content) {
@@ -604,7 +603,6 @@ async function startGame(tab) {
     if (!tab || tab.isProcessing) return;
 
     const epoch = tab.epoch;
-    tab.lastRunSteps = tab.settings.steps;
     tab.storyComplete = false;
     tab.autoplayStopped = false;
     tab.hasError = false;
@@ -688,7 +686,7 @@ async function nextStep(tab) {
                 tab.currentStep = data.step;
                 if (data.complete) {
                     tab.storyComplete = true;
-                    setStatus(tab, `<strong>Status:</strong> Adventure complete! (${data.step} steps) - Click "Play ${tab.lastRunSteps} More Steps" to keep going, or "Add Custom Steps..." to choose how many`);
+                    setStatus(tab, `<strong>Status:</strong> Adventure complete! (${data.step} steps) - Click "Add Custom Steps..." to keep going`);
                 } else {
                     setStatus(tab, `<strong>Status:</strong> Step ${data.step}/${tab.settings.steps}`);
                 }
@@ -708,16 +706,22 @@ async function nextStep(tab) {
     setProcessing(tab, false);
 }
 
+function runLabel(tab) {
+    return tab.totalRuns > 1 ? `Game ${tab.currentRun}/${tab.totalRuns} · ` : '';
+}
+
 async function autoplay(tab) {
     if (!tab || tab.isProcessing) return;
 
     const epoch = tab.epoch;
-    tab.lastRunSteps = tab.settings.steps;
     tab.isAutoPlaying = true;
     tab.storyComplete = false;
     tab.autoplayStopped = false;
     tab.hasError = false;
     tab.currentStep = 0;
+    tab.totalRuns = 1 + (tab.settings.repetitions || 0);   // repetitions = extra games after the first
+    tab.currentRun = 1;
+    tab.runsFinished = 0;
     tab.abortController = new AbortController();
 
     setProcessing(tab, true);
@@ -726,6 +730,12 @@ async function autoplay(tab) {
     updateBadge(tab);
     showLoader(tab, 'Starting the adventure...');
 
+    await streamAutoplay(tab, epoch, tab.totalRuns, 1);
+}
+
+// Plays `runs` complete games in a row on the server (each one reset + started fresh).
+// Used by Auto-play and by Resume when whole games are still left.
+async function streamAutoplay(tab, epoch, runs, firstRun) {
     let currentContent = '';
     let currentStep = 0;
 
@@ -733,7 +743,7 @@ async function autoplay(tab) {
         const response = await fetch('/api/autoplay', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(getRequestData(tab)),
+            body: JSON.stringify({ ...getRequestData(tab), runs, first_run: firstRun, total_runs: tab.totalRuns }),
             signal: tab.abortController.signal
         });
 
@@ -741,8 +751,21 @@ async function autoplay(tab) {
         let choiceShown = false;  // the player's pick of the current step is already on screen
 
         await readSSE(response, (data) => {
-            if (data.type === 'status') {
-                setStatus(tab, `<strong>Status:</strong> ${data.message}`);
+            if (data.type === 'run_start') {
+                // A new game of the series: the game was reset, start with an empty chat
+                tab.currentRun = data.run;
+                tab.currentStep = 0;
+                currentStep = 0;
+                tab.gameStarted = false;
+                bubbleOpen = false;
+                choiceShown = false;
+                currentContent = '';
+                clearChat(tab);
+                showLoader(tab, 'Starting the adventure...');
+                setStatus(tab, `<strong>Status:</strong> ${runLabel(tab)}Starting adventure...`);
+                renderTabs();
+            } else if (data.type === 'status') {
+                setStatus(tab, `<strong>Status:</strong> ${runLabel(tab)}${data.message}`);
                 if (!bubbleOpen) showLoader(tab);   // a new step is starting: show that the AI is working
             } else if (data.type === 'chunk') {
                 if (!choiceShown) { addChoice(tab, data.choice); choiceShown = true; }
@@ -754,25 +777,28 @@ async function autoplay(tab) {
             } else if (data.type === 'step_done') {
                 currentStep = data.step;
                 tab.currentStep = currentStep;
-                setStatus(tab, `<strong>Status:</strong> Auto-play Step ${currentStep}/${tab.settings.steps}`);
+                setStatus(tab, `<strong>Status:</strong> ${runLabel(tab)}Auto-play Step ${currentStep}/${tab.settings.steps}`);
                 bubbleOpen = false;
                 choiceShown = false;
                 currentContent = '';
                 tab.gameStarted = true;
+            } else if (data.type === 'run_complete') {
+                tab.runsFinished = data.run;
             } else if (data.type === 'complete') {
                 tab.storyComplete = true;
-                setStatus(tab, `<strong>Status:</strong> Auto-play complete! (${data.step} steps) - Click "Play ${tab.lastRunSteps} More Steps" to keep going, or "Add Custom Steps..." to choose how many`);
+                const games = tab.totalRuns > 1 ? `All ${tab.totalRuns} games complete` : 'Auto-play complete';
+                setStatus(tab, `<strong>Status:</strong> ${games}! (${data.step} steps${tab.totalRuns > 1 ? ' in the last game' : ''}) - Click "Add Custom Steps..." to keep going`);
             } else if (data.type === 'error') {
                 removeLoader(tab);
                 tab.hasError = true;
-                setStatus(tab, `<strong>Error:</strong> ${data.message}`);
+                setStatus(tab, `<strong>Error:</strong> ${runLabel(tab)}${data.message}`);
             }
         });
     } catch (error) {
         if (tab.epoch !== epoch) return; // tab was reset/closed
         if (error.name === 'AbortError') {
             tab.autoplayStopped = true;
-            setStatus(tab, `<strong>Status:</strong> Auto-play paused at step ${currentStep}. Click "Resume Auto-play" to continue automatically or "Next Step" to play manually.`);
+            setStatus(tab, `<strong>Status:</strong> ${runLabel(tab)}Auto-play paused at step ${currentStep}. Click "Resume Auto-play" to continue automatically or "Next Step" to play manually.`);
         } else {
             tab.hasError = true;
             setStatus(tab, `<strong>Error:</strong> ${error.message}`);
@@ -847,7 +873,7 @@ async function runStepLoop(tab, targetSteps, label) {
             // Check if we've reached the max or story is complete
             if (tab.currentStep >= targetSteps || tab.storyComplete) {
                 tab.storyComplete = true;
-                setStatus(tab, `<strong>Status:</strong> Auto-play complete! (${tab.currentStep} steps) - Click "Play ${tab.lastRunSteps} More Steps" to keep going, or "Add Custom Steps..." to choose how many`);
+                setStatus(tab, `<strong>Status:</strong> Auto-play complete! (${tab.currentStep} steps) - Click "Add Custom Steps..." to keep going`);
                 break;
             }
 
@@ -874,15 +900,33 @@ async function runStepLoop(tab, targetSteps, label) {
 async function resumeAutoplay(tab) {
     if (!tab || tab.isProcessing) return;
 
-    // Clear the stopped flag and resume auto-play
+    const epoch = tab.epoch;
     tab.autoplayStopped = false;
     tab.hasError = false;
     tab.isAutoPlaying = true;
     tab.abortController = new AbortController();
     setProcessing(tab, true);
-    setStatus(tab, '<strong>Status:</strong> Resuming auto-play...');
+    setStatus(tab, `<strong>Status:</strong> ${runLabel(tab)}Resuming auto-play...`);
 
-    if (!(await runStepLoop(tab, tab.settings.steps, 'Auto-play'))) return;
+    const gameUnfinished = tab.runsFinished < tab.currentRun;
+    if (gameUnfinished && tab.gameStarted) {
+        // Finish the game that was paused, step by step
+        if (!(await runStepLoop(tab, tab.settings.steps, `${runLabel(tab)}Auto-play`))) return;
+        if (tab.autoplayStopped || tab.hasError) {
+            tab.isAutoPlaying = false;
+            tab.abortController = null;
+            setProcessing(tab, false);
+            return;
+        }
+        tab.runsFinished = tab.currentRun;
+    }
+
+    // Whole games still to play: the paused one if it never got going, then the remaining repetitions
+    const firstRun = tab.runsFinished + 1;
+    if (firstRun <= tab.totalRuns) {
+        await streamAutoplay(tab, epoch, tab.totalRuns - firstRun + 1, firstRun);
+        return;
+    }
 
     tab.isAutoPlaying = false;
     tab.abortController = null;
@@ -890,7 +934,6 @@ async function resumeAutoplay(tab) {
 }
 
 function continueStoryManual(tab, stepsToAdd) {
-    tab.lastRunSteps = stepsToAdd;
     const newMax = tab.settings.steps + stepsToAdd;
     setTabSteps(tab, newMax);
 
@@ -905,7 +948,6 @@ function continueStoryManual(tab, stepsToAdd) {
 async function continueWithAutoplay(tab, stepsToAdd) {
     if (!tab || tab.isProcessing) return;
 
-    tab.lastRunSteps = stepsToAdd;
     const newMax = tab.settings.steps + stepsToAdd;
     setTabSteps(tab, newMax);
 
@@ -956,7 +998,9 @@ async function resetGame(tab) {
 
     // Reset slider to default
     setTabSteps(tab, 10, 20);
-    tab.lastRunSteps = 10;
+    tab.settings.repetitions = 0;
+    tab.totalRuns = 1; tab.currentRun = 1; tab.runsFinished = 0;
+    if (isActive(tab)) { repetitionsSlider.value = 0; updateSliderLabels(); }
 
     setStatus(tab, DEFAULT_STATUS);
     setProcessing(tab, false);

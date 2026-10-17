@@ -87,6 +87,11 @@
                 <label for="delaySlider">Auto-play delay: <span><span id="delayValue">3</span>s</span></label>
                 <input type="range" id="delaySlider" min="0" max="10" value="3">
             </div>
+
+            <div class="slider-container">
+                <label for="repetitionsSlider">Repetitions: <span id="repetitionsValue">0</span></label>
+                <input type="range" id="repetitionsSlider" min="0" max="100" value="0" title="0 = play once. Otherwise Auto-play resets the game and plays it again this many times, with no clicks in between">
+            </div>
         </aside>
 
         <!-- Main Chat Area -->
@@ -119,7 +124,6 @@
                 <button id="autoplayBtn" class="secondary-action" title="Start a new story and let the AI play all steps automatically">Auto-play All Steps</button>
                 <button id="stopBtn" class="danger-action" style="display: none;" title="Pause the automatic play (you can resume it)">Pause Auto-play</button>
                 <button id="resumeBtn" class="resume-action" style="display: none;" title="Continue the automatic play where it was paused">Resume Auto-play</button>
-                <button id="repeatBtn" class="success-action" style="display: none;" title="Continue the same story automatically for the same number of steps again">Play More Steps</button>
                 <button id="continueBtn" class="success-action" style="display: none;" title="Choose how many steps to add, and play them yourself or automatically">Add Custom Steps...</button>
                 <button id="resetBtn" class="reset-action" title="Clear this game and start over (other tabs are not affected)">Reset This Game</button>
             </div>
