@@ -1,5 +1,6 @@
 import random
 import os
+import uuid
 from typing import List, Tuple, Generator, Dict, Any, Optional
 from config import Config, StatusMessages, ErrorMessages
 from pathlib import Path
@@ -21,7 +22,7 @@ class ChatLogger:
 
     def start_new_session(self, model_info: dict = None):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.session_file = self.log_dir / f"chat_session_{timestamp}.txt"
+        self.session_file = self.log_dir / f"chat_session_{timestamp}_{uuid.uuid4().hex[:6]}.txt"
         try:
             with open(self.session_file, "a", encoding="utf-8") as f:
                 f.write(f"=== New Chat Session: {timestamp} ===\n")

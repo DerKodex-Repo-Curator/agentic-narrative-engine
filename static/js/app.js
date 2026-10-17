@@ -1,14 +1,19 @@
 // RPG Adventure - Flask Frontend JavaScript
+//
+// "+ New Game" adds a new tab INSIDE the page. Every tab is its own game with its own
+// session id, chat, settings and buttons state, so several games can run at the same time.
+// With only one tab the tab bar stays hidden, so the page looks exactly as before.
 
-const sessionId = 'session_' + Date.now();
-let isProcessing = false;
-let gameStarted = false;
-let isAutoPlaying = false;
-let storyComplete = false;
-let autoplayStopped = false; // Track if auto-play was manually stopped
-let abortController = null;
+const MAX_TABS = 6; // browsers allow about 6 parallel connections per server
+const DEFAULT_STATUS = 'Ready to start your adventure. Configure your AI provider, then click <strong>Start Game</strong> or <strong>Auto-play All Steps</strong>.';
+
+const tabs = [];
+let activeTabId = null;
+let tabCounter = 0;
 let selectedContinueMode = 'manual'; // 'manual' or 'auto'
-let lastRunSteps = 10; // size of the last run; the Repeat button runs this many more steps
+let modalTab = null;                 // tab the Continue dialog was opened for
+let settingsLoadToken = 0;
+const providerCache = new Map();
 
 // DOM Elements
 const providerSelect = document.getElementById('providerSelect');
@@ -22,6 +27,7 @@ const delayValue = document.getElementById('delayValue');
 const chatbox = document.getElementById('chatbox');
 const statusBar = document.getElementById('statusBar');
 const modelBadge = document.getElementById('modelBadge');
+const tabBar = document.getElementById('tabBar');
 const startBtn = document.getElementById('startBtn');
 const nextBtn = document.getElementById('nextBtn');
 const autoplayBtn = document.getElementById('autoplayBtn');
@@ -41,34 +47,68 @@ const modeAuto = document.getElementById('modeAuto');
 const cancelContinue = document.getElementById('cancelContinue');
 const confirmContinue = document.getElementById('confirmContinue');
 
+// ---------------------------------------------------------------------------
 // Initialize
-document.addEventListener('DOMContentLoaded', () => {
-    loadProviderModels(providerSelect.value);
-    updateSliderLabels();
+// ---------------------------------------------------------------------------
+document.addEventListener('DOMContentLoaded', async () => {
     setupEventListeners();
+    updateSliderLabels();
+
+    const config = await getProviderConfig(providerSelect.value);
+    if (config) populateModels(config, null);
+
+    const first = createTab(readSettingsFromUI());
+    activeTabId = first.id;
+    updateBadge(first);
+    renderTabs();
+    refreshControls();
 });
 
 function setupEventListeners() {
     // Provider change
-    providerSelect.addEventListener('change', () => {
-        loadProviderModels(providerSelect.value);
+    providerSelect.addEventListener('change', async () => {
+        const config = await getProviderConfig(providerSelect.value);
+        if (!config) return;
+        populateModels(config, null);
+        syncSettingsFromUI();
     });
 
-    // Slider updates
-    stepsSlider.addEventListener('input', updateSliderLabels);
-    delaySlider.addEventListener('input', updateSliderLabels);
+    // Sidebar settings belong to the tab you are looking at
+    modelSelect.addEventListener('change', syncSettingsFromUI);
+    apiKeyInput.addEventListener('input', syncSettingsFromUI);
+    apiUrlInput.addEventListener('input', syncSettingsFromUI);
+    stepsSlider.addEventListener('input', () => { updateSliderLabels(); syncSettingsFromUI(); });
+    delaySlider.addEventListener('input', () => { updateSliderLabels(); syncSettingsFromUI(); });
 
-    // Buttons
-    startBtn.addEventListener('click', startGame);
-    nextBtn.addEventListener('click', nextStep);
-    autoplayBtn.addEventListener('click', autoplay);
-    stopBtn.addEventListener('click', stopAutoplay);
-    resumeBtn.addEventListener('click', resumeAutoplay);
+    // Buttons (always act on the tab you are looking at)
+    startBtn.addEventListener('click', () => startGame(activeTab()));
+    nextBtn.addEventListener('click', () => nextStep(activeTab()));
+    autoplayBtn.addEventListener('click', () => autoplay(activeTab()));
+    stopBtn.addEventListener('click', () => stopAutoplay(activeTab()));
+    resumeBtn.addEventListener('click', () => resumeAutoplay(activeTab()));
     continueBtn.addEventListener('click', showContinueModal);
     // Repeat: one click, continues the SAME story from where it ended for another lastRunSteps steps
-    repeatBtn.addEventListener('click', () => continueWithAutoplay(lastRunSteps));
-    newGameBtn.addEventListener('click', resetGame);
-    resetBtn.addEventListener('click', resetGame);
+    repeatBtn.addEventListener('click', () => {
+        const tab = activeTab();
+        if (tab) continueWithAutoplay(tab, tab.lastRunSteps);
+    });
+    newGameBtn.addEventListener('click', addTab);            // "+ New Game" = new tab in the app
+    resetBtn.addEventListener('click', () => resetGame(activeTab()));
+
+    // Tab bar (event delegation)
+    tabBar.addEventListener('click', (e) => {
+        if (e.target.closest('.tab-add')) {
+            addTab();
+            return;
+        }
+        const tabEl = e.target.closest('.game-tab');
+        if (!tabEl) return;
+        if (e.target.closest('.tab-close')) {
+            closeTab(tabEl.dataset.id);
+        } else {
+            switchTab(tabEl.dataset.id);
+        }
+    });
 
     // Modal events
     closeModal.addEventListener('click', hideContinueModal);
@@ -94,77 +134,304 @@ function setupEventListeners() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Tab management
+// ---------------------------------------------------------------------------
+function readSettingsFromUI() {
+    return {
+        provider: providerSelect.value,
+        model: modelSelect.value,
+        apiKey: apiKeyInput.value,
+        apiUrl: apiUrlInput.value,
+        steps: parseInt(stepsSlider.value),
+        stepsMax: parseInt(stepsSlider.max),
+        delay: parseInt(delaySlider.value),
+    };
+}
+
+function createTab(settings) {
+    tabCounter++;
+    const tab = {
+        id: 'session_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+        title: 'Game ' + tabCounter,
+        holder: document.createElement('div'), // keeps this tab's messages while it is in the background
+        settings: { ...settings },
+        isProcessing: false,
+        gameStarted: false,
+        isAutoPlaying: false,
+        storyComplete: false,
+        autoplayStopped: false,
+        hasError: false,
+        abortController: null,
+        currentStep: 0,
+        lastRunSteps: settings.steps, // size of the last run; the Repeat button runs this many more steps
+        epoch: 0,                     // bumped on reset/close so stale async code can detect it
+        statusHtml: DEFAULT_STATUS,
+    };
+    tabs.push(tab);
+    return tab;
+}
+
+function getTab(id) {
+    return tabs.find(t => t.id === id) || null;
+}
+
+function activeTab() {
+    return getTab(activeTabId);
+}
+
+function isActive(tab) {
+    return tab.id === activeTabId;
+}
+
+// The element that currently holds this tab's messages
+function messageBox(tab) {
+    return isActive(tab) ? chatbox : tab.holder;
+}
+
+function addTab() {
+    const current = activeTab();
+    if (tabs.length >= MAX_TABS) {
+        if (current) setStatus(current, `<strong>Status:</strong> Maximum of ${MAX_TABS} game tabs reached. Close one to open another.`);
+        return;
+    }
+    // New game: same provider / model / key as the current tab, but a fresh 10-step game
+    const base = current ? current.settings : readSettingsFromUI();
+    const tab = createTab({ ...base, steps: 10, stepsMax: 20 });
+    switchTab(tab.id);
+}
+
+async function switchTab(id) {
+    if (id === activeTabId) return;
+    const next = getTab(id);
+    if (!next) return;
+
+    // Move the visible messages into the outgoing tab's holder and bring in the new tab's.
+    // Synchronous, so streaming callbacks can never interleave with it.
+    const prev = activeTab();
+    if (prev) {
+        while (chatbox.firstChild) prev.holder.appendChild(chatbox.firstChild);
+    }
+    activeTabId = id;
+    while (next.holder.firstChild) chatbox.appendChild(next.holder.firstChild);
+    chatbox.scrollTop = chatbox.scrollHeight;
+
+    statusBar.innerHTML = next.statusHtml;
+    renderTabs();
+    refreshControls();
+    await applySettingsToUI(next);
+}
+
+async function closeTab(id) {
+    const tab = getTab(id);
+    if (!tab) return;
+
+    if (tab.isProcessing && !confirm(`"${tab.title}" is still running. Close it anyway?`)) {
+        return;
+    }
+
+    // Closing the only tab just resets it
+    if (tabs.length === 1) {
+        await resetGame(tab);
+        return;
+    }
+
+    tab.epoch++;
+    if (tab.abortController) tab.abortController.abort();
+    fetch('/api/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: tab.id })
+    }).catch(() => {});
+
+    const idx = tabs.indexOf(tab);
+    tabs.splice(idx, 1);
+
+    if (id === activeTabId) {
+        chatbox.innerHTML = ''; // these messages belonged to the closed tab
+        activeTabId = null;
+        await switchTab(tabs[Math.min(idx, tabs.length - 1)].id);
+    } else {
+        renderTabs();
+    }
+}
+
+function renderTabs() {
+    // With a single game the bar stays hidden, so the page looks like it always did
+    tabBar.style.display = tabs.length > 1 ? 'flex' : 'none';
+    tabBar.innerHTML = '';
+
+    tabs.forEach(tab => {
+        const el = document.createElement('div');
+        el.className = 'game-tab'
+            + (isActive(tab) ? ' active' : '')
+            + (tab.isProcessing ? ' running' : '')
+            + (tab.storyComplete && !tab.isProcessing ? ' done' : '')
+            + (tab.hasError ? ' error' : '');
+        el.dataset.id = tab.id;
+        el.setAttribute('role', 'tab');
+
+        const dot = document.createElement('span');
+        dot.className = 'tab-dot';
+
+        const title = document.createElement('span');
+        title.className = 'tab-title';
+        title.textContent = tab.title;
+
+        const close = document.createElement('button');
+        close.className = 'tab-close';
+        close.type = 'button';
+        close.title = 'Close tab';
+        close.setAttribute('aria-label', `Close ${tab.title}`);
+        close.innerHTML = '&times;';
+
+        el.append(dot, title, close);
+        tabBar.appendChild(el);
+    });
+
+    const add = document.createElement('button');
+    add.className = 'tab-add';
+    add.type = 'button';
+    add.title = 'New game tab';
+    add.textContent = '+';
+    add.disabled = tabs.length >= MAX_TABS;
+    tabBar.appendChild(add);
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar <-> tab settings
+// ---------------------------------------------------------------------------
+async function getProviderConfig(provider) {
+    if (providerCache.has(provider)) return providerCache.get(provider);
+    try {
+        const response = await fetch(`/api/provider/${encodeURIComponent(provider)}`);
+        const config = await response.json();
+        providerCache.set(provider, config);
+        return config;
+    } catch (error) {
+        console.error('Error loading provider config:', error);
+        return null;
+    }
+}
+
+function populateModels(config, preferredModel) {
+    modelSelect.innerHTML = '';
+    config.models.forEach(model => {
+        const option = document.createElement('option');
+        option.value = model;
+        option.textContent = model;
+        modelSelect.appendChild(option);
+    });
+
+    const wanted = preferredModel && config.models.includes(preferredModel)
+        ? preferredModel
+        : config.default_model;
+    modelSelect.value = wanted;
+
+    // Show/hide API key based on requirement
+    apiKeyInput.style.display = config.requires_key ? 'block' : 'none';
+}
+
+async function applySettingsToUI(tab) {
+    const token = ++settingsLoadToken;
+    const s = tab.settings;
+
+    providerSelect.value = s.provider;
+    const config = await getProviderConfig(s.provider);
+    if (token !== settingsLoadToken || !config) return; // user switched again meanwhile
+
+    populateModels(config, s.model);
+    s.model = modelSelect.value;
+    apiKeyInput.value = s.apiKey;
+    apiUrlInput.value = s.apiUrl;
+    stepsSlider.max = s.stepsMax; // max first, then value
+    stepsSlider.value = s.steps;
+    delaySlider.value = s.delay;
+    updateSliderLabels();
+    updateBadge(tab);
+}
+
+function syncSettingsFromUI() {
+    const tab = activeTab();
+    if (!tab) return;
+    tab.settings = { ...tab.settings, ...readSettingsFromUI() };
+    updateBadge(tab);
+}
+
+function updateBadge(tab) {
+    if (isActive(tab)) {
+        modelBadge.textContent = `${tab.settings.provider} - ${tab.settings.model}`;
+    }
+}
+
 function updateSliderLabels() {
     stepsValue.textContent = stepsSlider.value;
     delayValue.textContent = delaySlider.value;
 }
 
-async function loadProviderModels(provider) {
-    try {
-        const response = await fetch(`/api/provider/${encodeURIComponent(provider)}`);
-        const config = await response.json();
-
-        modelSelect.innerHTML = '';
-        config.models.forEach(model => {
-            const option = document.createElement('option');
-            option.value = model;
-            option.textContent = model;
-            if (model === config.default_model) {
-                option.selected = true;
-            }
-            modelSelect.appendChild(option);
-        });
-
-        // Show/hide API key based on requirement
-        apiKeyInput.style.display = config.requires_key ? 'block' : 'none';
-
-        // Update model badge
-        modelBadge.textContent = `${provider} - ${config.default_model}`;
-    } catch (error) {
-        console.error('Error loading provider config:', error);
+function setTabSteps(tab, steps, max) {
+    tab.settings.steps = steps;
+    tab.settings.stepsMax = max !== undefined ? max : Math.max(tab.settings.stepsMax, 20, steps);
+    if (isActive(tab)) {
+        stepsSlider.max = tab.settings.stepsMax;
+        stepsSlider.value = steps;
+        updateSliderLabels();
     }
 }
 
-function setStatus(message) {
-    statusBar.innerHTML = message;
+// ---------------------------------------------------------------------------
+// Per-tab UI helpers
+// ---------------------------------------------------------------------------
+function setStatus(tab, message) {
+    tab.statusHtml = message;
+    if (isActive(tab)) statusBar.innerHTML = message;
 }
 
-function setProcessing(processing) {
-    isProcessing = processing;
-    startBtn.disabled = processing || gameStarted;
-    nextBtn.disabled = processing || !gameStarted || storyComplete;
-    autoplayBtn.disabled = processing || gameStarted;
+function setProcessing(tab, processing) {
+    tab.isProcessing = processing;
+    renderTabs();
+    if (isActive(tab)) refreshControls();
+}
+
+// Update the button row to reflect the tab you are looking at
+function refreshControls() {
+    const tab = activeTab();
+    if (!tab) return;
+
+    startBtn.disabled = tab.isProcessing || tab.gameStarted;
+    nextBtn.disabled = tab.isProcessing || !tab.gameStarted || tab.storyComplete;
+    autoplayBtn.disabled = tab.isProcessing || tab.gameStarted;
 
     // Show/hide stop button based on auto-play state
-    stopBtn.style.display = isAutoPlaying ? 'block' : 'none';
+    stopBtn.style.display = tab.isAutoPlaying ? 'block' : 'none';
 
     // Show resume button when auto-play was stopped (and not complete)
-    resumeBtn.style.display = (autoplayStopped && !storyComplete && !isAutoPlaying) ? 'block' : 'none';
+    resumeBtn.style.display = (tab.autoplayStopped && !tab.storyComplete && !tab.isAutoPlaying) ? 'block' : 'none';
 
-    // Show continue button when story is complete
-    continueBtn.style.display = storyComplete ? 'block' : 'none';
-
-    // Show Repeat button when story is complete
-    repeatBtn.textContent = `Repeat (+${lastRunSteps} steps)`;
-    repeatBtn.style.display = storyComplete ? 'block' : 'none';
-    repeatBtn.disabled = processing;
+    // Show continue + repeat buttons when story is complete
+    continueBtn.style.display = tab.storyComplete ? 'block' : 'none';
+    repeatBtn.textContent = `Play ${tab.lastRunSteps} More Step${tab.lastRunSteps === 1 ? '' : 's'}`;
+    repeatBtn.style.display = tab.storyComplete ? 'block' : 'none';
+    repeatBtn.disabled = tab.isProcessing;
 }
 
-function addMessage(role, content) {
+function addMessage(tab, role, content) {
+    const box = messageBox(tab);
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${role}`;
     messageDiv.innerHTML = formatContent(content);
-    chatbox.appendChild(messageDiv);
-    chatbox.scrollTop = chatbox.scrollHeight;
+    box.appendChild(messageDiv);
+    if (isActive(tab)) box.scrollTop = box.scrollHeight;
     return messageDiv;
 }
 
-function updateLastBotMessage(content) {
-    const messages = chatbox.querySelectorAll('.message.bot');
+function updateLastBotMessage(tab, content) {
+    const box = messageBox(tab);
+    const messages = box.querySelectorAll('.message.bot');
     if (messages.length > 0) {
         const lastMessage = messages[messages.length - 1];
         lastMessage.innerHTML = formatContent(content);
-        chatbox.scrollTop = chatbox.scrollHeight;
+        if (isActive(tab)) box.scrollTop = box.scrollHeight;
     }
 }
 
@@ -176,19 +443,72 @@ function formatContent(content) {
         .replace(/\n/g, '<br>');
 }
 
-function clearChat() {
-    chatbox.innerHTML = '';
+function clearChat(tab) {
+    removeLoader(tab);
+    messageBox(tab).innerHTML = '';
 }
 
-function getRequestData(extraSteps = 0) {
+// ---------------------------------------------------------------------------
+// Loader: a Game Master bubble with animated dots, shown while we wait for the AI,
+// so the player can see that something is happening and nothing has failed.
+// ---------------------------------------------------------------------------
+const LOADER_TEXT = 'The Game Master is writing the next scene...';
+const LOADER_SLOW_TEXT = 'Still working... the model is taking a while (normal for local models or the first request).';
+
+function showLoader(tab, text) {
+    if (tab.loaderEl && tab.loaderEl.parentNode) return tab.loaderEl;   // already showing
+    const el = addMessage(tab, 'bot', '');
+    el.classList.add('loading');
+    el.innerHTML = '<span class="typing"><span class="typing-dots"><span></span><span></span><span></span></span>'
+                 + '<span class="typing-text"></span></span>';
+    const label = el.querySelector('.typing-text');
+    label.textContent = text || LOADER_TEXT;
+    tab.loaderEl = el;
+    tab.loaderTimer = setTimeout(() => { label.textContent = LOADER_SLOW_TEXT; }, 20000);
+    return el;
+}
+
+// The player's choice arrives before the AI's text: show it in front of the loader bubble,
+// which keeps spinning until the reply really starts.
+function addChoice(tab, choice) {
+    if (!choice) return;
+    const el = (tab.loaderEl && tab.loaderEl.parentNode) ? tab.loaderEl : null;
+    if (!el) { addMessage(tab, 'user', String(choice)); return; }
+    const user = document.createElement('div');
+    user.className = 'message user';
+    user.innerHTML = formatContent(String(choice));
+    el.parentNode.insertBefore(user, el);
+}
+
+// The reply text has started: turn the loader bubble into the real Game Master bubble.
+function takeLoader(tab) {
+    const el = (tab.loaderEl && tab.loaderEl.parentNode) ? tab.loaderEl : null;
+    clearTimeout(tab.loaderTimer);
+    tab.loaderEl = null;
+    if (el) {
+        el.classList.remove('loading');
+        el.innerHTML = '';
+        return el;
+    }
+    return addMessage(tab, 'bot', '');
+}
+
+function removeLoader(tab) {
+    clearTimeout(tab.loaderTimer);
+    if (tab.loaderEl && tab.loaderEl.parentNode) tab.loaderEl.remove();
+    tab.loaderEl = null;
+}
+
+function getRequestData(tab) {
+    const s = tab.settings;
     return {
-        provider: providerSelect.value,
-        model: modelSelect.value,
-        api_key: apiKeyInput.value,
-        api_url: apiUrlInput.value,
-        max_steps: parseInt(stepsSlider.value) + extraSteps,
-        delay: parseInt(delaySlider.value),
-        session_id: sessionId
+        provider: s.provider,
+        model: s.model,
+        api_key: s.apiKey,
+        api_url: s.apiUrl,
+        max_steps: s.steps,
+        delay: s.delay,
+        session_id: tab.id
     };
 }
 
@@ -244,8 +564,11 @@ async function readSSE(response, onEvent) {
     }
 }
 
-// Modal functions
+// ---------------------------------------------------------------------------
+// Continue-story modal (acts on the tab that was visible when it was opened)
+// ---------------------------------------------------------------------------
 function showContinueModal() {
+    modalTab = activeTab();
     continueModal.classList.add('active');
     addStepsInput.value = 5;
     selectMode('manual');
@@ -263,70 +586,88 @@ function selectMode(mode) {
 
 function confirmContinueStory() {
     const stepsToAdd = parseInt(addStepsInput.value) || 5;
+    const tab = modalTab && tabs.includes(modalTab) ? modalTab : activeTab();
     hideContinueModal();
+    if (!tab) return;
 
     if (selectedContinueMode === 'auto') {
-        continueWithAutoplay(stepsToAdd);
+        continueWithAutoplay(tab, stepsToAdd);
     } else {
-        continueStoryManual(stepsToAdd);
+        continueStoryManual(tab, stepsToAdd);
     }
 }
 
-async function startGame() {
-    if (isProcessing) return;
-    lastRunSteps = parseInt(stepsSlider.value);
+// ---------------------------------------------------------------------------
+// Game actions
+// ---------------------------------------------------------------------------
+async function startGame(tab) {
+    if (!tab || tab.isProcessing) return;
 
-    setProcessing(true);
-    storyComplete = false;
-    autoplayStopped = false;
-    clearChat();
-    setStatus('<strong>Status:</strong> Starting adventure...');
-    modelBadge.textContent = `${providerSelect.value} - ${modelSelect.value}`;
+    const epoch = tab.epoch;
+    tab.lastRunSteps = tab.settings.steps;
+    tab.storyComplete = false;
+    tab.autoplayStopped = false;
+    tab.hasError = false;
+    tab.currentStep = 0;
+
+    setProcessing(tab, true);
+    clearChat(tab);
+    setStatus(tab, '<strong>Status:</strong> Starting adventure...');
+    updateBadge(tab);
 
     let currentContent = '';
-    addMessage('bot', '');
+    showLoader(tab, 'The Game Master is setting the scene...');
 
     try {
         const response = await fetch('/api/start', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(getRequestData())
+            body: JSON.stringify(getRequestData(tab))
         });
 
         await readSSE(response, (data) => {
             if (data.type === 'chunk') {
+                if (data.content && tab.loaderEl) takeLoader(tab);
                 currentContent += data.content;
-                updateLastBotMessage(currentContent);
+                updateLastBotMessage(tab, currentContent);
             } else if (data.type === 'done') {
-                gameStarted = true;
-                setStatus(`<strong>Status:</strong> Game started. Step ${data.step}/${stepsSlider.value}`);
+                tab.gameStarted = true;
+                setStatus(tab, `<strong>Status:</strong> Game started. Step ${data.step}/${tab.settings.steps} - press "Next Step" to play`);
             } else if (data.type === 'error') {
-                setStatus(`<strong>Error:</strong> ${data.message}`);
+                removeLoader(tab);
+                tab.hasError = true;
+                setStatus(tab, `<strong>Error:</strong> ${data.message}`);
             }
         });
     } catch (error) {
-        setStatus(`<strong>Error:</strong> ${error.message}`);
+        tab.hasError = true;
+        setStatus(tab, `<strong>Error:</strong> ${error.message}`);
     }
 
-    setProcessing(false);
+    if (tab.epoch !== epoch) return; // tab was reset or closed meanwhile
+    removeLoader(tab);
+    setProcessing(tab, false);
 }
 
-async function nextStep() {
-    if (isProcessing || !gameStarted) return;
+async function nextStep(tab) {
+    if (!tab || tab.isProcessing || !tab.gameStarted) return;
 
+    const epoch = tab.epoch;
     // Clear the autoplayStopped flag when manually stepping
-    autoplayStopped = false;
+    tab.autoplayStopped = false;
+    tab.hasError = false;
 
-    setProcessing(true);
-    setStatus('<strong>Status:</strong> Taking next step...');
+    setProcessing(tab, true);
+    setStatus(tab, '<strong>Status:</strong> Taking next step...');
 
     let currentContent = '';
+    showLoader(tab);
 
     try {
         const response = await fetch('/api/step', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(getRequestData())
+            body: JSON.stringify(getRequestData(tab))
         });
 
         let messageAdded = false;
@@ -334,146 +675,143 @@ async function nextStep() {
         await readSSE(response, (data) => {
             if (data.type === 'chunk') {
                 if (!messageAdded) {
-                    // Add player choice (none when the GM is just continuing the story)
-                    if (data.choice) addMessage('user', data.choice.toString());
-                    addMessage('bot', '');
+                    // Player choice goes in front of the loader (none when the GM is just continuing the story)
+                    addChoice(tab, data.choice);
                     messageAdded = true;
                 }
-                currentContent += data.content;
-                updateLastBotMessage(currentContent);
+                if (data.content) {
+                    if (tab.loaderEl) takeLoader(tab);
+                    currentContent += data.content;
+                    updateLastBotMessage(tab, currentContent);
+                }
             } else if (data.type === 'done') {
+                tab.currentStep = data.step;
                 if (data.complete) {
-                    storyComplete = true;
-                    setStatus(`<strong>Status:</strong> Adventure complete! (${data.step} steps) - Click "Continue Story" to keep playing`);
+                    tab.storyComplete = true;
+                    setStatus(tab, `<strong>Status:</strong> Adventure complete! (${data.step} steps) - Click "Play ${tab.lastRunSteps} More Steps" to keep going, or "Add Custom Steps..." to choose how many`);
                 } else {
-                    setStatus(`<strong>Status:</strong> Step ${data.step}/${stepsSlider.value}`);
+                    setStatus(tab, `<strong>Status:</strong> Step ${data.step}/${tab.settings.steps}`);
                 }
             } else if (data.type === 'error') {
-                setStatus(`<strong>Error:</strong> ${data.message}`);
+                removeLoader(tab);
+                tab.hasError = true;
+                setStatus(tab, `<strong>Error:</strong> ${data.message}`);
             }
         });
     } catch (error) {
-        setStatus(`<strong>Error:</strong> ${error.message}`);
+        tab.hasError = true;
+        setStatus(tab, `<strong>Error:</strong> ${error.message}`);
     }
 
-    setProcessing(false);
+    if (tab.epoch !== epoch) return;
+    removeLoader(tab);
+    setProcessing(tab, false);
 }
 
-async function autoplay() {
-    if (isProcessing) return;
-    lastRunSteps = parseInt(stepsSlider.value);
+async function autoplay(tab) {
+    if (!tab || tab.isProcessing) return;
 
-    setProcessing(true);
-    isAutoPlaying = true;
-    storyComplete = false;
-    autoplayStopped = false;
-    clearChat();
-    setStatus('<strong>Status:</strong> Auto-play starting...');
-    modelBadge.textContent = `${providerSelect.value} - ${modelSelect.value}`;
+    const epoch = tab.epoch;
+    tab.lastRunSteps = tab.settings.steps;
+    tab.isAutoPlaying = true;
+    tab.storyComplete = false;
+    tab.autoplayStopped = false;
+    tab.hasError = false;
+    tab.currentStep = 0;
+    tab.abortController = new AbortController();
 
-    // Show stop button
-    stopBtn.style.display = 'block';
-    resumeBtn.style.display = 'none';
+    setProcessing(tab, true);
+    clearChat(tab);
+    setStatus(tab, '<strong>Status:</strong> Auto-play starting...');
+    updateBadge(tab);
+    showLoader(tab, 'Starting the adventure...');
 
     let currentContent = '';
     let currentStep = 0;
-
-    // Create abort controller for this request
-    abortController = new AbortController();
 
     try {
         const response = await fetch('/api/autoplay', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(getRequestData()),
-            signal: abortController.signal
+            body: JSON.stringify(getRequestData(tab)),
+            signal: tab.abortController.signal
         });
 
-        let lastMessageType = null;
+        let bubbleOpen = false;   // true while a reply bubble is being filled
+        let choiceShown = false;  // the player's pick of the current step is already on screen
 
         await readSSE(response, (data) => {
             if (data.type === 'status') {
-                setStatus(`<strong>Status:</strong> ${data.message}`);
+                setStatus(tab, `<strong>Status:</strong> ${data.message}`);
+                if (!bubbleOpen) showLoader(tab);   // a new step is starting: show that the AI is working
             } else if (data.type === 'chunk') {
-                if (data.choice && lastMessageType !== 'user') {
-                    // Add player choice
-                    addMessage('user', data.choice.toString());
-                    addMessage('bot', '');
-                    currentContent = '';
-                    lastMessageType = 'user';
-                } else if (!lastMessageType || lastMessageType === 'step_done') {
-                    // Start new bot message
-                    addMessage('bot', '');
-                    currentContent = '';
-                    lastMessageType = 'bot';
+                if (!choiceShown) { addChoice(tab, data.choice); choiceShown = true; }
+                if (data.content) {
+                    if (!bubbleOpen) { takeLoader(tab); currentContent = ''; bubbleOpen = true; }
+                    currentContent += data.content;
+                    updateLastBotMessage(tab, currentContent);
                 }
-                currentContent += data.content;
-                updateLastBotMessage(currentContent);
             } else if (data.type === 'step_done') {
                 currentStep = data.step;
-                setStatus(`<strong>Status:</strong> Auto-play Step ${currentStep}/${stepsSlider.value}`);
-                lastMessageType = 'step_done';
+                tab.currentStep = currentStep;
+                setStatus(tab, `<strong>Status:</strong> Auto-play Step ${currentStep}/${tab.settings.steps}`);
+                bubbleOpen = false;
+                choiceShown = false;
                 currentContent = '';
-                gameStarted = true;
+                tab.gameStarted = true;
             } else if (data.type === 'complete') {
-                storyComplete = true;
-                setStatus(`<strong>Status:</strong> Auto-play complete! (${data.step} steps) - Click "Continue Story" to keep playing`);
+                tab.storyComplete = true;
+                setStatus(tab, `<strong>Status:</strong> Auto-play complete! (${data.step} steps) - Click "Play ${tab.lastRunSteps} More Steps" to keep going, or "Add Custom Steps..." to choose how many`);
             } else if (data.type === 'error') {
-                setStatus(`<strong>Error:</strong> ${data.message}`);
+                removeLoader(tab);
+                tab.hasError = true;
+                setStatus(tab, `<strong>Error:</strong> ${data.message}`);
             }
         });
     } catch (error) {
+        if (tab.epoch !== epoch) return; // tab was reset/closed
         if (error.name === 'AbortError') {
-            autoplayStopped = true;
-            setStatus(`<strong>Status:</strong> Auto-play stopped at step ${currentStep}. Click "Resume" to continue auto-play or "Next Step" for manual.`);
+            tab.autoplayStopped = true;
+            setStatus(tab, `<strong>Status:</strong> Auto-play paused at step ${currentStep}. Click "Resume Auto-play" to continue automatically or "Next Step" to play manually.`);
         } else {
-            setStatus(`<strong>Error:</strong> ${error.message}`);
+            tab.hasError = true;
+            setStatus(tab, `<strong>Error:</strong> ${error.message}`);
         }
     }
 
-    isAutoPlaying = false;
-    abortController = null;
-    setProcessing(false);
+    if (tab.epoch !== epoch) return;
+    removeLoader(tab);
+    tab.isAutoPlaying = false;
+    tab.abortController = null;
+    setProcessing(tab, false);
 }
 
-function stopAutoplay() {
-    if (abortController) {
-        abortController.abort();
-        isAutoPlaying = false;
-        stopBtn.style.display = 'none';
-        setStatus('<strong>Status:</strong> Stopping auto-play...');
+function stopAutoplay(tab) {
+    if (tab && tab.abortController) {
+        tab.abortController.abort();
+        tab.isAutoPlaying = false;
+        setStatus(tab, '<strong>Status:</strong> Stopping auto-play...');
+        renderTabs();
+        if (isActive(tab)) refreshControls();
     }
 }
 
-async function resumeAutoplay() {
-    if (isProcessing) return;
-
-    // Clear the stopped flag and resume auto-play
-    autoplayStopped = false;
-    setProcessing(true);
-    isAutoPlaying = true;
-    stopBtn.style.display = 'block';
-    resumeBtn.style.display = 'none';
-    setStatus('<strong>Status:</strong> Resuming auto-play...');
-
+// Shared loop for Resume and "continue with auto-play": take /api/step until targetSteps.
+// Returns false when the tab was reset/closed while it was running.
+async function runStepLoop(tab, targetSteps, label) {
+    const epoch = tab.epoch;
     let currentContent = '';
-    let currentStep = 0;
-
-    // Create abort controller for this request
-    abortController = new AbortController();
 
     try {
-        const maxSteps = parseInt(stepsSlider.value);
+        while (tab.currentStep < targetSteps) {
+            if (tab.abortController.signal.aborted) break;
 
-        // Loop and take steps until we reach max or get stopped
-        while (true) {
-            if (abortController.signal.aborted) break;
-
+            showLoader(tab);
             const response = await fetch('/api/step', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(getRequestData()),
-                signal: abortController.signal
+                body: JSON.stringify(getRequestData(tab)),
+                signal: tab.abortController.signal
             });
 
             let messageAdded = false;
@@ -482,204 +820,144 @@ async function resumeAutoplay() {
             await readSSE(response, (data) => {
                 if (data.type === 'chunk') {
                     if (!messageAdded) {
-                        if (data.choice) addMessage('user', data.choice.toString());
-                        addMessage('bot', '');
+                        // Player choice is missing when the GM is just continuing a finished story
+                        addChoice(tab, data.choice);
                         messageAdded = true;
                     }
-                    currentContent += data.content;
-                    updateLastBotMessage(currentContent);
+                    if (data.content) {
+                        if (tab.loaderEl) takeLoader(tab);
+                        currentContent += data.content;
+                        updateLastBotMessage(tab, currentContent);
+                    }
                 } else if (data.type === 'done') {
-                    currentStep = data.step;
+                    tab.currentStep = data.step;
                     if (data.complete) {
-                        storyComplete = true;
-                        setStatus(`<strong>Status:</strong> Auto-play complete! (${data.step} steps) - Click "Continue Story" to keep playing`);
+                        tab.storyComplete = true;
                     } else {
-                        setStatus(`<strong>Status:</strong> Auto-play Step ${currentStep}/${maxSteps}`);
+                        setStatus(tab, `<strong>Status:</strong> ${label} Step ${tab.currentStep}/${targetSteps}`);
                     }
                 } else if (data.type === 'error') {
-                    setStatus(`<strong>Error:</strong> ${data.message}`);
+                    removeLoader(tab);
+                    tab.hasError = true;
+                    setStatus(tab, `<strong>Error:</strong> ${data.message}`);
                     throw new Error(data.message);
                 }
             });
 
             // Check if we've reached the max or story is complete
-            if (currentStep >= maxSteps || storyComplete) {
-                if (!storyComplete) {
-                    storyComplete = true;
-                    setStatus(`<strong>Status:</strong> Auto-play complete! (${currentStep} steps) - Click "Continue Story" to keep playing`);
-                }
+            if (tab.currentStep >= targetSteps || tab.storyComplete) {
+                tab.storyComplete = true;
+                setStatus(tab, `<strong>Status:</strong> Auto-play complete! (${tab.currentStep} steps) - Click "Play ${tab.lastRunSteps} More Steps" to keep going, or "Add Custom Steps..." to choose how many`);
                 break;
             }
 
             // Delay between steps
-            const delay = parseInt(delaySlider.value) * 1000;
+            const delay = tab.settings.delay * 1000;
             if (delay > 0) {
                 await new Promise(resolve => setTimeout(resolve, delay));
             }
         }
     } catch (error) {
+        if (tab.epoch !== epoch) return false;
         if (error.name === 'AbortError') {
-            autoplayStopped = true;
-            setStatus(`<strong>Status:</strong> Auto-play stopped at step ${currentStep}. Click "Resume" to continue auto-play or "Next Step" for manual.`);
+            tab.autoplayStopped = true;
+            setStatus(tab, `<strong>Status:</strong> Auto-play paused at step ${tab.currentStep}. Click "Resume Auto-play" to continue automatically or "Next Step" to play manually.`);
         } else {
-            setStatus(`<strong>Error:</strong> ${error.message}`);
+            tab.hasError = true;
+            setStatus(tab, `<strong>Error:</strong> ${error.message}`);
         }
     }
-
-    isAutoPlaying = false;
-    abortController = null;
-    setProcessing(false);
+    if (tab.epoch === epoch) removeLoader(tab);
+    return tab.epoch === epoch;
 }
 
-function continueStoryManual(stepsToAdd) {
-    lastRunSteps = stepsToAdd;
-    // Update the max steps
-    const newMax = parseInt(stepsSlider.value) + stepsToAdd;
-    stepsSlider.value = newMax;
-    stepsSlider.max = Math.max(20, newMax);
-    stepsValue.textContent = newMax;
+async function resumeAutoplay(tab) {
+    if (!tab || tab.isProcessing) return;
+
+    // Clear the stopped flag and resume auto-play
+    tab.autoplayStopped = false;
+    tab.hasError = false;
+    tab.isAutoPlaying = true;
+    tab.abortController = new AbortController();
+    setProcessing(tab, true);
+    setStatus(tab, '<strong>Status:</strong> Resuming auto-play...');
+
+    if (!(await runStepLoop(tab, tab.settings.steps, 'Auto-play'))) return;
+
+    tab.isAutoPlaying = false;
+    tab.abortController = null;
+    setProcessing(tab, false);
+}
+
+function continueStoryManual(tab, stepsToAdd) {
+    tab.lastRunSteps = stepsToAdd;
+    const newMax = tab.settings.steps + stepsToAdd;
+    setTabSteps(tab, newMax);
 
     // Reset story complete flag so user can continue manually
-    storyComplete = false;
-    autoplayStopped = false;
+    tab.storyComplete = false;
+    tab.autoplayStopped = false;
 
-    // Update UI - user can now click "Next Step" to continue
-    setProcessing(false);
-    setStatus(`<strong>Status:</strong> Story extended! Click "Next Step" to continue. (${stepsSlider.value - getCurrentStep()}/${stepsSlider.value} steps remaining)`);
+    setProcessing(tab, false);
+    setStatus(tab, `<strong>Status:</strong> Story extended! Click "Next Step" to continue. (${newMax - tab.currentStep} steps remaining)`);
 }
 
-function getCurrentStep() {
-    // Parse current step from status or return 0
-    const statusText = statusBar.textContent;
-    const match = statusText.match(/Step (\d+)/);
-    return match ? parseInt(match[1]) : 0;
-}
+async function continueWithAutoplay(tab, stepsToAdd) {
+    if (!tab || tab.isProcessing) return;
 
-async function continueWithAutoplay(stepsToAdd) {
-    if (isProcessing) return;
-    lastRunSteps = stepsToAdd;
-
-    // Update the max steps
-    const currentMax = parseInt(stepsSlider.value);
-    const newMax = currentMax + stepsToAdd;
-    stepsSlider.value = newMax;
-    stepsSlider.max = Math.max(20, newMax);
-    stepsValue.textContent = newMax;
+    tab.lastRunSteps = stepsToAdd;
+    const newMax = tab.settings.steps + stepsToAdd;
+    setTabSteps(tab, newMax);
 
     // Reset story complete and start auto-playing
-    storyComplete = false;
-    autoplayStopped = false;
-    setProcessing(true);
-    isAutoPlaying = true;
-    stopBtn.style.display = 'block';
-    resumeBtn.style.display = 'none';
-    setStatus('<strong>Status:</strong> Continuing with auto-play...');
+    tab.storyComplete = false;
+    tab.autoplayStopped = false;
+    tab.hasError = false;
+    tab.isAutoPlaying = true;
+    tab.abortController = new AbortController();
+    setProcessing(tab, true);
+    setStatus(tab, '<strong>Status:</strong> Continuing with auto-play...');
 
-    let currentContent = '';
-    let currentStep = currentMax; // Start from where we were
+    if (!(await runStepLoop(tab, newMax, 'Auto-play continuing...'))) return;
 
-    // Create abort controller for this request
-    abortController = new AbortController();
-
-    try {
-        // We'll loop and take steps until we reach the new max
-        while (currentStep < newMax) {
-            if (abortController.signal.aborted) break;
-
-            setStatus(`<strong>Status:</strong> Auto-play continuing... Step ${currentStep + 1}/${newMax}`);
-
-            const response = await fetch('/api/step', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(getRequestData()),
-                signal: abortController.signal
-            });
-
-            let messageAdded = false;
-            currentContent = '';
-
-            await readSSE(response, (data) => {
-                if (data.type === 'chunk') {
-                    if (!messageAdded) {
-                        if (data.choice) addMessage('user', data.choice.toString());
-                        addMessage('bot', '');
-                        messageAdded = true;
-                    }
-                    currentContent += data.content;
-                    updateLastBotMessage(currentContent);
-                } else if (data.type === 'done') {
-                    currentStep = data.step;
-                    if (data.complete) {
-                        storyComplete = true;
-                        setStatus(`<strong>Status:</strong> Auto-play complete! (${data.step} steps) - Click "Continue Story" to keep playing`);
-                    } else {
-                        setStatus(`<strong>Status:</strong> Auto-play Step ${currentStep}/${newMax}`);
-                    }
-                } else if (data.type === 'error') {
-                    setStatus(`<strong>Error:</strong> ${data.message}`);
-                    throw new Error(data.message);
-                }
-            });
-
-            // Check if we've reached the max
-            if (currentStep >= newMax) {
-                storyComplete = true;
-                setStatus(`<strong>Status:</strong> Auto-play complete! (${currentStep} steps) - Click "Continue Story" to keep playing`);
-                break;
-            }
-
-            // Delay between steps
-            const delay = parseInt(delaySlider.value) * 1000;
-            if (delay > 0) {
-                await new Promise(resolve => setTimeout(resolve, delay));
-            }
-        }
-    } catch (error) {
-        if (error.name === 'AbortError') {
-            autoplayStopped = true;
-            setStatus(`<strong>Status:</strong> Auto-play stopped at step ${currentStep}. Click "Resume" to continue auto-play or "Next Step" for manual.`);
-        } else {
-            setStatus(`<strong>Error:</strong> ${error.message}`);
-        }
-    }
-
-    isAutoPlaying = false;
-    abortController = null;
-    setProcessing(false);
+    tab.isAutoPlaying = false;
+    tab.abortController = null;
+    setProcessing(tab, false);
 }
 
-async function resetGame() {
-    // Stop any ongoing autoplay
-    if (abortController) {
-        abortController.abort();
+async function resetGame(tab) {
+    if (!tab) return;
+
+    // Invalidate in-flight work for this tab, then stop it
+    tab.epoch++;
+    if (tab.abortController) {
+        tab.abortController.abort();
     }
 
     try {
         await fetch('/api/reset', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: sessionId })
+            body: JSON.stringify({ session_id: tab.id })
         });
     } catch (e) {
         // Ignore reset errors
     }
 
-    clearChat();
-    gameStarted = false;
-    isAutoPlaying = false;
-    storyComplete = false;
-    autoplayStopped = false;
-    abortController = null;
+    clearChat(tab);
+    tab.gameStarted = false;
+    tab.isAutoPlaying = false;
+    tab.isProcessing = false;
+    tab.storyComplete = false;
+    tab.autoplayStopped = false;
+    tab.hasError = false;
+    tab.abortController = null;
+    tab.currentStep = 0;
 
     // Reset slider to default
-    stepsSlider.value = 10;
-    stepsSlider.max = 20;
-    stepsValue.textContent = '10';
-    lastRunSteps = 10;
+    setTabSteps(tab, 10, 20);
+    tab.lastRunSteps = 10;
 
-    // Hide resume button
-    resumeBtn.style.display = 'none';
-
-    setStatus('Ready to start your adventure. Configure your AI provider and click <strong>Start</strong>.');
-    setProcessing(false);
+    setStatus(tab, DEFAULT_STATUS);
+    setProcessing(tab, false);
 }

@@ -382,13 +382,8 @@ class ChatClient:
                     logger.info(f"Result preview: {result[:150]}...")
                     logger.info(f"Result ending: ...{result[-150:]}")
 
-                    # ✅ Append directly to the active chat log
-                    try:
-                        if hasattr(self, "chat_logger") and getattr(self, "chat_logger", None):
-                            self.chat_logger.append_message("GM", result)
-                            logger.info("Final GM response appended to chat log")
-                    except Exception as log_error:
-                        logger.warning(f"Could not append final response to chat log: {log_error}")
+                    # NOTE: the reply is NOT logged here. GameState.take_step_streaming() logs the final
+                    # GM message once, after it has completed it (logging here too wrote it twice).
 
                     # Yield the complete response
                     logger.info("Yielding final response...")
@@ -398,14 +393,6 @@ class ChatClient:
                 else:
                     logger.error("Non-streaming returned empty result for final step")
                     fallback = "The story concludes with a sense of resolution and completion."
-
-                    # ✅ Append fallback to the chat log as well
-                    try:
-                        if hasattr(self, "chat_logger") and getattr(self, "chat_logger", None):
-                            self.chat_logger.append_message("GM", fallback)
-                            logger.info("Fallback GM response appended to chat log")
-                    except Exception as log_error:
-                        logger.warning(f"Could not append fallback to chat log: {log_error}")
 
                     yield fallback
 
